@@ -1,6 +1,8 @@
 //! Markdown parsing into a small document model that the layout engine walks.
 
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use pulldown_cmark::{Alignment, BlockQuoteKind, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
@@ -36,7 +38,9 @@ pub struct ImageRef {
     pub url: String,
     pub alt: String,
     /// Link id pointing at the image itself, so it can be opened.
-    pub self_link: usize,
+    pub self_link: Option<usize>,
+    /// Diagram source for images rendered from Mermaid code blocks.
+    pub mermaid: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -58,6 +62,11 @@ pub enum Block {
     Code {
         lang: String,
         text: String,
+    },
+    /// A Mermaid code block, rendered as the image `img`.
+    Mermaid {
+        img: usize,
+        source: String,
     },
     Quote {
         kind: Option<BlockQuoteKind>,
@@ -199,7 +208,11 @@ impl P<'_> {
                         CodeBlockKind::Indented => String::new(),
                     };
                     let text = self.collect_text(&|t| matches!(t, TagEnd::CodeBlock));
-                    out.push(Block::Code { lang, text });
+                    if lang.eq_ignore_ascii_case("mermaid") {
+                        out.push(self.mermaid(text));
+                    } else {
+                        out.push(Block::Code { lang, text });
+                    }
                 }
                 Event::Start(Tag::List(start)) => {
                     flush(&mut loose, &mut out);
@@ -393,9 +406,21 @@ impl P<'_> {
     }
 
     fn push_image(&mut self, url: String, alt: String, out: &mut Vec<Inline>) {
-        let self_link = self.add_link(url.clone());
-        self.doc.images.push(ImageRef { url, alt, self_link });
+        let self_link = Some(self.add_link(url.clone()));
+        self.doc.images.push(ImageRef { url, alt, self_link, mermaid: None });
         out.push(Inline::Image { idx: self.doc.images.len() - 1, link: self.links.last().copied() });
+    }
+
+    fn mermaid(&mut self, source: String) -> Block {
+        let mut hasher = DefaultHasher::new();
+        source.hash(&mut hasher);
+        self.doc.images.push(ImageRef {
+            url: format!("mermaid:{:016x}", hasher.finish()),
+            alt: "Mermaid diagram".into(),
+            self_link: None,
+            mermaid: Some(source.clone()),
+        });
+        Block::Mermaid { img: self.doc.images.len() - 1, source }
     }
 
     /// Handles raw HTML: common formatting tags, `<img>`, `<a>`, and `<br>`

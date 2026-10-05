@@ -6,6 +6,10 @@
 - **Images** through the [graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/).
   `mdv` uses Unicode placeholders, so images scroll and clip like text and also work in tmux.
   It handles PNG, JPEG, GIF, WebP, BMP and SVG, from local files, `http(s)` URLs and `data:` URIs.
+- **Mermaid diagrams**: ` ```mermaid ` code blocks are rendered to images in-process with
+  [mermaid-rs-renderer](https://github.com/1jehuang/mermaid-rs-renderer) (no Node or browser
+  needed) and shown inline. Click a diagram to copy its source. Diagrams that fail to parse
+  fall back to their source with the error shown.
 - **Big headings** through the [text sizing protocol](https://sw.kovidgoyal.net/kitty/text-sizing-protocol/):
   H1 renders at 2× and H2 at 1.5×.
 - **Links** you can use: `#anchors` jump to the heading, links to other Markdown files open

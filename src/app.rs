@@ -229,8 +229,12 @@ impl App {
         self.doc = doc::parse(&source.text);
         let base = source.base_dir();
         self.image_keys = self.doc.images.iter().map(|i| Images::resolve(&i.url, &base)).collect();
-        for key in &self.image_keys {
-            self.images.request(key);
+        let dark = self.theme.bg.luminance() < 0.5;
+        for (img, key) in self.doc.images.iter().zip(&self.image_keys) {
+            match &img.mermaid {
+                Some(source) => self.images.request_mermaid(key, source, dark, self.theme.bg),
+                None => self.images.request(key),
+            }
         }
         let mut widest = 0;
         visit_headings(&self.doc.blocks, &self.doc.images, &mut |level, title| {
@@ -269,6 +273,7 @@ impl App {
         let anchor = self.current_heading().map(|i| (i, self.scroll - self.layout.headings[i].line.min(self.scroll)));
         let (keys, images) = (&self.image_keys, &self.images);
         let dims = |i: usize| images.dims(&keys[i]);
+        let errors = |i: usize| images.error(&keys[i]);
         let broken: Vec<bool> = self.link_info.iter().map(|l| l.broken).collect();
         let env = Env {
             theme: &self.theme,
@@ -277,6 +282,7 @@ impl App {
             image_dims: &dims,
             cell: self.caps.cell,
             max_image_rows: (g.rows as usize).saturating_sub(3),
+            image_error: &errors,
             broken_links: &broken,
         };
         self.layout = layout::layout(&self.doc, g.content_w as usize, &env);
