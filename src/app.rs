@@ -701,12 +701,17 @@ impl App {
                 let Some(press) = self.press.take() else { return false };
                 match self.selection {
                     Some(sel) if sel.anchor != sel.cur => {
-                        let text = self.selected_text(&sel);
+                        // Copy the Markdown behind the selection; fall back to
+                        // the rendered text where there's no source mapping.
+                        let (text, kind) = match self.selected_source(&sel) {
+                            Some(src) => (src, " of Markdown"),
+                            None => (self.selected_text(&sel), ""),
+                        };
                         let lines = text.lines().count();
                         let what = if lines > 1 {
-                            format!("{lines} lines")
+                            format!("{lines} lines{kind}")
                         } else {
-                            format!("{} chars", text.chars().count())
+                            format!("{} chars{kind}", text.chars().count())
                         };
                         self.copy(&text, &what);
                     }
@@ -854,6 +859,38 @@ impl App {
         out.join("\n")
     }
 
+    /// The Markdown source behind a selection. The selected cells map to a
+    /// byte range of the file; a selection that starts (or ends) a rendered
+    /// line takes the whole source line's markup with it (`- `, `> `, `## `,
+    /// table pipes), so whole blocks copy as valid Markdown.
+    pub fn selected_source(&self, sel: &Selection) -> Option<String> {
+        let source = self.source.text.as_str();
+        let (a, b) = sel.range();
+        let mut start: Option<(usize, bool)> = None;
+        let mut end: Option<(usize, bool)> = None;
+        for li in a.line..=b.line.min(self.layout.lines.len().saturating_sub(1)) {
+            let line = &self.layout.lines[li];
+            let Some((mut from, mut to)) = sel.cols(li) else { continue };
+            if matches!(line.kind, Kind::Heading { .. }) {
+                // Scaled headings don't map columns 1:1; take them whole.
+                (from, to) = (0, usize::MAX);
+            }
+            let cells = src_cells(line);
+            for (i, &(col, w, s, e)) in cells.iter().enumerate() {
+                if col < to && col + w.max(1) > from {
+                    start.get_or_insert((s, i == 0));
+                    end = Some((e, i + 1 == cells.len()));
+                }
+            }
+        }
+        let ((s, line_start), (e, line_end)) = (start?, end?);
+        let (s, e) = (s.min(e), s.max(e));
+        let s = if line_start { snap_line_start(source, s) } else { s };
+        let e = if line_end { snap_line_end(source, e) } else { e };
+        let text = source.get(s..e)?.trim_end_matches('\n');
+        (!text.is_empty()).then(|| text.to_string())
+    }
+
     fn copy(&mut self, text: &str, what: &str) {
         let protocol = if self.caps.clipboard { clipboard::Protocol::Kitty } else { clipboard::Protocol::Osc52 };
         clipboard::copy(text, protocol, &mut self.pending);
@@ -914,6 +951,45 @@ impl App {
     }
 }
 
+/// `(column, width, source start, source end)` for every cell of a line
+/// that has a source position.
+fn src_cells(line: &layout::Line) -> Vec<(usize, usize, usize, usize)> {
+    let mut cells = Vec::new();
+    let mut col = 0;
+    for seg in &line.segs {
+        let w = seg.width();
+        match (seg.src, seg.image) {
+            (Some(s), Some(_)) => cells.push((col, w, s.char_start(0), s.char_end(0, 0, 0))),
+            (Some(s), None) => {
+                let mut c = col;
+                for (off, ch) in seg.text.char_indices() {
+                    let cw = ch.width().unwrap_or(0);
+                    cells.push((c, cw, s.char_start(off), s.char_end(off, ch.len_utf8(), seg.text.len())));
+                    c += cw;
+                }
+            }
+            (None, _) => {}
+        }
+        col += w;
+    }
+    cells
+}
+
+/// Moves `off` back to the start of its source line if only block markup
+/// (list markers, quote marks, heading hashes, table pipes) precedes it.
+fn snap_line_start(source: &str, off: usize) -> usize {
+    let line_start = source[..off].rfind('\n').map_or(0, |i| i + 1);
+    let lead = &source[line_start..off];
+    if lead.chars().all(|c| c.is_whitespace() || "#>*+-.)[]xX|^:0123456789".contains(c)) { line_start } else { off }
+}
+
+/// Moves `off` to the end of its source line if only closing markup follows.
+fn snap_line_end(source: &str, off: usize) -> usize {
+    let line_end = source[off..].find('\n').map_or(source.len(), |i| off + i);
+    let tail = &source[off..line_end];
+    if tail.chars().all(|c| c.is_whitespace() || "|*_~`".contains(c)) { line_end } else { off }
+}
+
 fn lower(c: char) -> char {
     c.to_lowercase().next().unwrap_or(c)
 }
@@ -934,6 +1010,64 @@ fn visit_headings(blocks: &[Block], images: &[ImageRef], f: &mut dyn FnMut(u8, &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn app(md: &str) -> App {
+        let caps =
+            Caps { graphics: false, text_sizing: false, cell: (10, 20), bg: None, tmux: false, clipboard: false };
+        let source = Source { path: None, name: "t.md".into(), text: md.into(), mtime: None };
+        let opts = Options { toc: false, max_width: Some(60) };
+        App::new(caps, Theme::new(true, None), Images::new(false, false), source, opts)
+    }
+
+    /// Position of the `nth` occurrence of `needle` in the rendered lines.
+    fn find(app: &App, needle: &str, nth: usize) -> Pos {
+        app.layout
+            .lines
+            .iter()
+            .enumerate()
+            .flat_map(|(i, l)| {
+                let plain = l.plain();
+                plain.match_indices(needle).map(|(b, _)| Pos { line: i, col: plain[..b].width() }).collect::<Vec<_>>()
+            })
+            .nth(nth)
+            .unwrap_or_else(|| panic!("{needle:?} not rendered"))
+    }
+
+    /// Copies from the first char of `from` to the last char of `to`.
+    fn copy_between(md: &str, from: &str, to: &str) -> String {
+        let app = app(md);
+        let a = find(&app, from, 0);
+        let b = find(&app, to, 0);
+        let cur = Pos { line: b.line, col: b.col + to.width() - 1 };
+        app.selected_source(&Selection { anchor: a, cur }).expect("source for selection")
+    }
+
+    #[test]
+    fn copies_markdown_source_of_selection() {
+        let p = "Some **bold** text and [a link](https://x.y) here.\n";
+        assert_eq!(copy_between(p, "bold", "bold"), "**bold**");
+        assert_eq!(copy_between(p, "ome", "bo"), "ome **bo");
+        assert_eq!(copy_between(p, "a link", "a link"), "[a link](https://x.y)");
+        assert_eq!(copy_between(p, "Some", "here."), "Some **bold** text and [a link](https://x.y) here.");
+
+        assert_eq!(copy_between("- one\n- two\n\nAfter.\n", "one", "two"), "- one\n- two");
+        assert_eq!(copy_between("> quoted *words*\n", "quoted", "words"), "> quoted *words*");
+        assert_eq!(copy_between("## Title\n\ntext\n", "Title", "Title"), "## Title");
+
+        let table = "| A | B |\n|---|---|\n| 1 | 2 |\n";
+        assert_eq!(copy_between(table, "A", "2"), table.trim_end());
+    }
+
+    #[test]
+    fn copies_fenced_code_with_fences() {
+        let md = "```rust\nlet a = 1;\n```\n";
+        let app = app(md);
+        let header = find(&app, "rust", 0);
+        let bottom = Pos { line: header.line + 2, col: 3 };
+        let sel = Selection { anchor: Pos { line: header.line, col: 0 }, cur: bottom };
+        assert_eq!(app.selected_source(&sel).unwrap(), md.trim_end());
+        assert_eq!(copy_between(md, "a = 1", "a = 1"), "a = 1");
+    }
 
     #[test]
     fn resolves_and_flags_broken_links() {

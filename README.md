@@ -24,7 +24,8 @@
   language set (via two-face), including TypeScript/TSX, Kotlin, TOML, protobuf, SCSS/Sass,
   Diff and Fish, plus a bundled grammar for Prisma.
 - Copying through kitty's [clipboard protocol](https://sw.kovidgoyal.net/kitty/clipboard/):
-  click a code block to copy its source, or drag to select text (like tmux copy mode).
+  click a code block to copy its source, or drag to select (like tmux copy mode) and get the
+  Markdown source of the selection, markup included.
   Falls back to OSC 52 on other terminals and inside tmux.
 - Search, live reload when the file changes, mouse support, dark and light themes.
 
@@ -66,7 +67,7 @@ column; by default it fills the window), `--theme auto|dark|light`.
 | `Enter`                 | Follow the focused link             |
 | Hover                   | Show a link's target                |
 | Click a code block      | Copy its source to the clipboard    |
-| Drag                    | Select text; copied on release      |
+| Drag                    | Select; copies its Markdown source on release |
 | Click                   | Follow a link, or jump via the contents |
 | `Backspace` `h` / right-click | Go back                       |
 | `/` `n` `N`             | Search, next / previous match       |
