@@ -95,6 +95,43 @@ def fib(n: int) -> int:
 cargo install --path . && mdv README.md
 ```
 
+```tsx
+export function Greeting({ name }: { name: string }) {
+  return <h1 className="title">Hello, {name}!</h1>;
+}
+```
+
+```kotlin
+data class User(val id: Int, val name: String)
+
+fun main() = listOf(User(1, "Ada")).forEach { println(it.name) }
+```
+
+```prisma
+model User {
+  id    Int     @id @default(autoincrement())
+  email String  @unique
+  posts Post[]
+}
+```
+
+```toml
+[package]
+name = "mdv"
+edition = "2024"
+```
+
+```diff
+-    let width = 100;
++    let width = available_width();
+```
+
+```fish
+for file in *.md
+    mdv $file
+end
+```
+
     Indented code block without a language.
 
 $$
