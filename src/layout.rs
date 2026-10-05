@@ -112,6 +112,8 @@ pub struct Env<'a> {
     pub image_dims: &'a dyn Fn(usize) -> Option<(u32, u32)>,
     pub cell: (u16, u16),
     pub max_image_rows: usize,
+    /// Why an image failed to load, by `Doc::images` index.
+    pub image_error: &'a dyn Fn(usize) -> Option<String>,
     /// Per link id: true when the target is a missing file or anchor.
     pub broken_links: &'a [bool],
 }
@@ -183,6 +185,23 @@ impl Builder<'_> {
             }
             Block::Heading { level, inlines, anchor } => self.heading(*level, inlines, anchor, first, rest, width),
             Block::Code { lang, text } => self.code(lang, text, lang, first, rest, width),
+            Block::Mermaid { img, source } => match self.image_cell(*img, width) {
+                Some(cell) => {
+                    let start = self.out.lines.len();
+                    self.flow(vec![Piece::Image(cell, None)], first, rest, width);
+                    self.push(rest, vec![Seg::decor("mermaid · click to copy source", Style::fg(t.dim).italic())]);
+                    let text = source.trim_end().to_string();
+                    self.out.code_blocks.push(CodeSpan { start, end: self.out.lines.len(), text });
+                }
+                // Not rendered (yet): show the source, with the error if it failed.
+                None => {
+                    let label = match (self.env.image_error)(*img) {
+                        Some(e) => format!("mermaid · ✖ {e}"),
+                        None => "mermaid".to_string(),
+                    };
+                    self.code("mermaid", source, &label, first, rest, width);
+                }
+            },
             Block::FrontMatter(text) => self.code("yaml", text, "front matter", first, rest, width),
             Block::Quote { kind, blocks } => {
                 let (color, title) = match kind {
@@ -469,7 +488,7 @@ impl Builder<'_> {
                 Inline::Break => cur.push(Seg::new("\n", base)),
                 Inline::Image { idx, link } => {
                     let cell = if images { self.image_cell(*idx, width) } else { None };
-                    let link = link.or(Some(self.doc.images[*idx].self_link));
+                    let link = link.or(self.doc.images[*idx].self_link);
                     match cell {
                         Some(cell) if cell.rows == 1 => cur.push(Seg { image: Some(cell), link, ..Seg::new("", base) }),
                         Some(cell) => {

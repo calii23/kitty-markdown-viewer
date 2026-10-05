@@ -191,6 +191,7 @@ fn dump(source: &Source, args: &Args) {
         image_dims: &no_images,
         cell: (10, 20),
         max_image_rows: 40,
+        image_error: &|_| None,
         broken_links: &[],
     };
     let width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80).min(args.width.unwrap_or(u16::MAX)) as usize;

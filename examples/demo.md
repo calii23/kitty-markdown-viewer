@@ -101,6 +101,35 @@ $$
 \int_0^1 x^2 \, dx = \frac{1}{3}
 $$
 
+## Diagrams
+
+Mermaid code blocks are rendered to images. Click one to copy its source.
+
+```mermaid
+flowchart LR
+    A[Markdown] --> B{Mermaid block?}
+    B -- yes --> C[Render SVG]
+    C --> D[Rasterize PNG]
+    D --> E[Graphics protocol]
+    B -- no --> F[Syntax highlight]
+```
+
+```mermaid
+sequenceDiagram
+    participant V as mdv
+    participant K as kitty
+    V->>K: OSC 66 sized heading
+    V->>K: APC G transmit image
+    K-->>V: CPR / DA1 replies
+```
+
+A diagram with a syntax error falls back to its source:
+
+```mermaid
+flowchart LR
+    A --> 
+```
+
 ## Tables
 
 | Feature          | Protocol            | Status |

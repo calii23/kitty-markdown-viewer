@@ -15,6 +15,7 @@ use resvg::{tiny_skia, usvg};
 
 use crate::kitty;
 use crate::links::percent_decode;
+use crate::style::Rgb;
 
 /// Larger images are downscaled before transmission.
 const MAX_SIDE: u32 = 2048;
@@ -29,7 +30,7 @@ pub struct Loaded {
 enum Entry {
     Loading,
     Ready(Arc<Loaded>),
-    Failed,
+    Failed(String),
 }
 
 pub struct Images {
@@ -55,7 +56,7 @@ impl Images {
     /// Turns an image reference into a loader key: URLs stay as they are,
     /// paths become absolute.
     pub fn resolve(url: &str, base: &Path) -> String {
-        if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("data:") {
+        if ["http://", "https://", "data:", "mermaid:"].iter().any(|p| url.starts_with(p)) {
             return url.to_string();
         }
         let path = url.strip_prefix("file://").unwrap_or(url);
@@ -74,6 +75,27 @@ impl Images {
             let result = load(&key);
             let _ = tx.send((key, result));
         });
+    }
+
+    /// Renders a Mermaid diagram in the background, stored under `key`.
+    pub fn request_mermaid(&mut self, key: &str, source: &str, dark: bool, bg: Rgb) {
+        if !self.enabled || self.entries.contains_key(key) {
+            return;
+        }
+        self.entries.insert(key.to_string(), Entry::Loading);
+        let tx = self.tx.clone();
+        let (key, source) = (key.to_string(), source.to_string());
+        std::thread::spawn(move || {
+            let result = render_mermaid(&source, dark, bg);
+            let _ = tx.send((key, result));
+        });
+    }
+
+    pub fn error(&self, key: &str) -> Option<String> {
+        match self.entries.get(key) {
+            Some(Entry::Failed(e)) => Some(e.clone()),
+            _ => None,
+        }
     }
 
     pub fn dims(&self, key: &str) -> Option<(u32, u32)> {
@@ -96,7 +118,7 @@ impl Images {
                     changed = true;
                     Entry::Ready(Arc::new(img))
                 }
-                Err(_) => Entry::Failed,
+                Err(e) => Entry::Failed(e),
             };
             self.entries.insert(key, entry);
         }
@@ -139,6 +161,25 @@ fn load(key: &str) -> Result<Loaded, String> {
         let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
         (img.width(), img.height(), img)
     };
+    encode(width, height, img)
+}
+
+/// Mermaid source to SVG (mermaid-rs-renderer), then to PNG like any SVG.
+fn render_mermaid(source: &str, dark: bool, bg: Rgb) -> Result<Loaded, String> {
+    use mermaid_rs_renderer::{RenderOptions, Theme};
+    let mut opts = RenderOptions::modern();
+    if dark {
+        opts.theme = Theme::dark();
+    }
+    opts.theme.background = format!("#{:02x}{:02x}{:02x}", bg.0, bg.1, bg.2);
+    let svg = mermaid_rs_renderer::render_with_options(source, opts)
+        .map_err(|e| e.to_string().lines().next().unwrap_or("invalid diagram").to_string())?;
+    let (_, _, img) = render_svg(svg.as_bytes())?;
+    // Report the 2x raster size so diagrams come out readable, not thumbnails.
+    encode(img.width(), img.height(), img)
+}
+
+fn encode(width: u32, height: u32, img: DynamicImage) -> Result<Loaded, String> {
     let img = if img.width() > MAX_SIDE || img.height() > MAX_SIDE {
         img.resize(MAX_SIDE, MAX_SIDE, image::imageops::FilterType::Triangle)
     } else {
@@ -201,4 +242,22 @@ fn render_svg(bytes: &[u8]) -> Result<(u32, u32, DynamicImage), String> {
         *dst = image::Rgba([c.red(), c.green(), c.blue(), c.alpha()]);
     }
     Ok((w.round() as u32, h.round() as u32, DynamicImage::ImageRgba8(rgba)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_mermaid_to_png() {
+        let img = render_mermaid("flowchart LR\n  A --> B --> C\n", true, Rgb(30, 30, 46)).unwrap();
+        assert!(img.width > img.height, "LR flowchart should be wide: {}x{}", img.width, img.height);
+        assert!(img.png.starts_with(b"\x89PNG"));
+    }
+
+    #[test]
+    fn mermaid_errors_are_one_line() {
+        let err = render_mermaid("not a diagram at all", true, Rgb(0, 0, 0)).err().unwrap();
+        assert!(!err.contains('\n'));
+    }
 }
