@@ -20,7 +20,9 @@
 - **Table of contents** sidebar that highlights the section you're reading. Click an entry to jump to it.
 - GitHub-flavored Markdown: tables, task lists, strikethrough, footnotes, alerts
   (`> [!NOTE]`), definition lists, math, front matter, and inline HTML (`<img>`, `<br>`, `<kbd>`, …).
-- Syntax highlighting for fenced code blocks.
+- Syntax highlighting for fenced code blocks in [bat](https://github.com/sharkdp/bat)'s
+  language set (via two-face), including TypeScript/TSX, Kotlin, TOML, protobuf, SCSS/Sass,
+  Diff and Fish, plus a bundled grammar for Prisma.
 - Copying through kitty's [clipboard protocol](https://sw.kovidgoyal.net/kitty/clipboard/):
   click a code block to copy its source, or drag to select text (like tmux copy mode).
   Falls back to OSC 52 on other terminals and inside tmux.

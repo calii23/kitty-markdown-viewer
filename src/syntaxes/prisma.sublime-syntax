@@ -1,0 +1,104 @@
+%YAML 1.2
+---
+# Prisma schema language (schema.prisma). Not in syntect's or bat's sets.
+name: Prisma
+file_extensions: [prisma]
+scope: source.prisma
+
+contexts:
+  main:
+    - include: comments
+    - match: '\b(model|enum|type|view)\s+([A-Za-z_]\w*)'
+      captures:
+        1: keyword.declaration.prisma
+        2: entity.name.type.prisma
+      push: block
+    - match: '\b(datasource|generator)\s+([A-Za-z_]\w*)'
+      captures:
+        1: keyword.declaration.prisma
+        2: entity.name.prisma
+      push: config
+
+  comments:
+    - match: '///.*$'
+      scope: comment.line.documentation.prisma
+    - match: '//.*$'
+      scope: comment.line.double-slash.prisma
+
+  block:
+    - match: '\}'
+      pop: true
+    - include: comments
+    - include: attributes
+    - match: '^\s*([A-Za-z_]\w*)\s+([A-Za-z_]\w*)(\[\])?(\?)?'
+      captures:
+        1: variable.other.member.prisma
+        2: storage.type.prisma
+        3: keyword.operator.prisma
+        4: keyword.operator.prisma
+    - match: '^\s*([A-Za-z_]\w*)\s*$'
+      scope: constant.other.enum.prisma
+    - include: values
+
+  config:
+    - match: '\}'
+      pop: true
+    - include: comments
+    - match: '^\s*([A-Za-z_]\w*)\s*(=)'
+      captures:
+        1: variable.other.member.prisma
+        2: keyword.operator.assignment.prisma
+    - include: values
+
+  attributes:
+    - match: '@@?[A-Za-z_][\w.]*'
+      scope: entity.other.attribute-name.prisma
+      push: attribute-args
+
+  attribute-args:
+    - match: '\('
+      push: args
+    - match: '(?=\S)|$'
+      pop: true
+
+  args:
+    - match: '\)'
+      pop: true
+    - match: '\b([A-Za-z_]\w*)\s*(:)'
+      captures:
+        1: variable.parameter.prisma
+        2: punctuation.separator.prisma
+    - include: values
+
+  values:
+    - match: '"'
+      push: string
+    - match: '\b(true|false|null)\b'
+      scope: constant.language.prisma
+    - match: '\b(String|Boolean|Int|BigInt|Float|Decimal|DateTime|Json|Bytes|Unsupported)\b'
+      scope: storage.type.prisma
+    - match: '\b([A-Za-z_]\w*)(?=\()'
+      scope: support.function.prisma
+      push: call
+    - match: '\b-?\d+(\.\d+)?\b'
+      scope: constant.numeric.prisma
+    - match: '\['
+      push: array
+
+  call:
+    - match: '\('
+      set: args
+    - match: '(?=\S)|$'
+      pop: true
+
+  array:
+    - match: '\]'
+      pop: true
+    - include: values
+
+  string:
+    - meta_scope: string.quoted.double.prisma
+    - match: '\\.'
+      scope: constant.character.escape.prisma
+    - match: '"'
+      pop: true
