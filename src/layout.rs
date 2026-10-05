@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use pulldown_cmark::{Alignment, BlockQuoteKind};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::doc::{Block, Doc, Inline, InlineStyle, Item, plain_text};
+use crate::doc::{Block, CodeSrc, Doc, Inline, InlineStyle, Item, Src, plain_text};
 use crate::highlight::Highlighter;
 use crate::kitty::{MAX_PLACEHOLDER_CELLS, Scale};
 use crate::style::Style;
@@ -27,13 +27,15 @@ pub struct Seg {
     pub style: Style,
     pub link: Option<usize>,
     pub image: Option<ImageCell>,
+    /// Where this text sits in the Markdown source, for copying selections.
+    pub src: Option<Src>,
     /// Decoration (code block padding, quote bars) left out of copied text.
     pub decor: bool,
 }
 
 impl Seg {
     pub fn new(text: impl Into<String>, style: Style) -> Seg {
-        Seg { text: text.into(), style, link: None, image: None, decor: false }
+        Seg { text: text.into(), style, link: None, image: None, decor: false, src: None }
     }
 
     pub fn decor(text: impl Into<String>, style: Style) -> Seg {
@@ -126,7 +128,7 @@ pub fn layout(doc: &Doc, width: usize, env: &Env) -> Layout {
 
 enum Piece {
     Segs(Vec<Seg>),
-    Image(ImageCell, Option<usize>),
+    Image(ImageCell, Option<usize>, Option<Src>),
 }
 
 struct Builder<'a> {
@@ -184,12 +186,15 @@ impl Builder<'_> {
                 self.flow(pieces, first, rest, width);
             }
             Block::Heading { level, inlines, anchor } => self.heading(*level, inlines, anchor, first, rest, width),
-            Block::Code { lang, text } => self.code(lang, text, lang, first, rest, width),
-            Block::Mermaid { img, source } => match self.image_cell(*img, width) {
+            Block::Code { lang, text, src } => self.code(lang, text, lang, Some(src), first, rest, width),
+            Block::Mermaid { img, source, src } => match self.image_cell(*img, width) {
                 Some(cell) => {
                     let start = self.out.lines.len();
-                    self.flow(vec![Piece::Image(cell, None)], first, rest, width);
-                    self.push(rest, vec![Seg::decor("mermaid · click to copy source", Style::fg(t.dim).italic())]);
+                    let span = Some(Src::span(src.block.0, src.block.1));
+                    self.flow(vec![Piece::Image(cell, None, span)], first, rest, width);
+                    let caption =
+                        Seg { src: span, ..Seg::decor("mermaid · click to copy source", Style::fg(t.dim).italic()) };
+                    self.push(rest, vec![caption]);
                     let text = source.trim_end().to_string();
                     self.out.code_blocks.push(CodeSpan { start, end: self.out.lines.len(), text });
                 }
@@ -199,10 +204,10 @@ impl Builder<'_> {
                         Some(e) => format!("mermaid · ✖ {e}"),
                         None => "mermaid".to_string(),
                     };
-                    self.code("mermaid", source, &label, first, rest, width);
+                    self.code("mermaid", source, &label, Some(src), first, rest, width);
                 }
             },
-            Block::FrontMatter(text) => self.code("yaml", text, "front matter", first, rest, width),
+            Block::FrontMatter(text, src) => self.code("yaml", text, "front matter", Some(src), first, rest, width),
             Block::Quote { kind, blocks } => {
                 let (color, title) = match kind {
                     Some(BlockQuoteKind::Note) => (t.note, Some("ⓘ Note")),
@@ -226,7 +231,10 @@ impl Builder<'_> {
             }
             Block::List { start, items } => self.list(*start, items, first, rest, width, depth),
             Block::Table { aligns, head, rows } => self.table(aligns, head, rows, first, rest, width),
-            Block::Rule => self.push(first, vec![Seg::new("─".repeat(width), Style::fg(t.border))]),
+            Block::Rule(a, b) => {
+                let seg = Seg { src: Some(Src::span(*a, *b)), ..Seg::new("─".repeat(width), Style::fg(t.border)) };
+                self.push(first, vec![seg]);
+            }
             Block::Footnote { label, blocks } => {
                 self.out.anchors.insert(format!("fn-{label}"), self.out.lines.len());
                 let marker = format!("[{label}] ");
@@ -330,7 +338,17 @@ impl Builder<'_> {
         }
     }
 
-    fn code(&mut self, lang: &str, text: &str, label: &str, first: &[Seg], rest: &[Seg], width: usize) {
+    #[allow(clippy::too_many_arguments)]
+    fn code(
+        &mut self,
+        lang: &str,
+        text: &str,
+        label: &str,
+        src: Option<&CodeSrc>,
+        first: &[Seg],
+        rest: &[Seg],
+        width: usize,
+    ) {
         let t = self.env.theme;
         let bg = t.code_bg;
         let inner = width.saturating_sub(2).max(1);
@@ -350,22 +368,34 @@ impl Builder<'_> {
             header.push(Seg::decor(" ".repeat(free - hint.width()), Style::default().on(bg)));
             header.push(Seg::decor(hint, Style::fg(t.dim).on(bg)));
         }
-        self.push(first, pad(header));
+        // The header and footer rows stand for the fences when copying.
+        let at = |off: usize| src.map(|_| Src::span(off, off));
+        let with_src =
+            |segs: Vec<Seg>, s: Option<Src>| segs.into_iter().map(|g| Seg { src: s, ..g }).collect::<Vec<_>>();
+        self.push(first, with_src(pad(header), src.and_then(|c| at(c.block.0))));
         let code = text.strip_suffix('\n').unwrap_or(text);
-        for line in self.env.hl.highlight(code, lang) {
+        let line_lens: Vec<usize> = code.split_inclusive('\n').map(str::len).collect();
+        let mut line_off = 0;
+        for (i, line) in self.env.hl.highlight(code, lang).into_iter().enumerate() {
+            let mut off = line_off;
             let segs: Vec<Seg> = line
                 .into_iter()
                 .map(|(mut st, text)| {
                     st.fg = st.fg.or(Some(t.fg));
                     st.bg = Some(bg);
-                    Seg::new(text.replace('\t', "    "), st)
+                    let seg_src = src
+                        .and_then(|c| c.offset(off))
+                        .map(|start| Src { exact: !text.contains('\t'), ..Src::span(start, start + text.len()) });
+                    off += text.len();
+                    Seg { src: seg_src, ..Seg::new(text.replace('\t', "    "), st) }
                 })
                 .collect();
+            line_off += line_lens.get(i).copied().unwrap_or(0);
             for row in hard_wrap(&segs, inner) {
                 self.push(rest, pad(row));
             }
         }
-        self.push(rest, pad(Vec::new()));
+        self.push(rest, with_src(pad(Vec::new()), src.and_then(|c| at(c.block.1))));
         self.out.code_blocks.push(CodeSpan { start, end: self.out.lines.len(), text: code.to_string() });
     }
 
@@ -484,16 +514,19 @@ impl Builder<'_> {
         let mut cur: Vec<Seg> = Vec::new();
         for i in inl {
             match i {
-                Inline::Text { text, style, link } => cur.push(self.seg(text, *style, *link, base)),
+                Inline::Text { text, style, link, src } => cur.push(self.seg(text, *style, *link, *src, base)),
                 Inline::Break => cur.push(Seg::new("\n", base)),
-                Inline::Image { idx, link } => {
+                Inline::Image { idx, link, src } => {
+                    let src = *src;
                     let cell = if images { self.image_cell(*idx, width) } else { None };
                     let link = link.or(self.doc.images[*idx].self_link);
                     match cell {
-                        Some(cell) if cell.rows == 1 => cur.push(Seg { image: Some(cell), link, ..Seg::new("", base) }),
+                        Some(cell) if cell.rows == 1 => {
+                            cur.push(Seg { image: Some(cell), link, src, ..Seg::new("", base) })
+                        }
                         Some(cell) => {
                             out.push(Piece::Segs(std::mem::take(&mut cur)));
-                            out.push(Piece::Image(cell, link));
+                            out.push(Piece::Image(cell, link, src));
                         }
                         None => {
                             let alt = &self.doc.images[*idx].alt;
@@ -501,7 +534,11 @@ impl Builder<'_> {
                             let color = if self.is_broken(link) { t.caution } else { t.dim };
                             let mut st = Style::fg(color).italic();
                             st.underline = true;
-                            cur.push(Seg { link, ..Seg::new(format!("▣\u{a0}{label}"), st) });
+                            cur.push(Seg {
+                                link,
+                                src: src.map(Src::inexact),
+                                ..Seg::new(format!("▣\u{a0}{label}"), st)
+                            });
                         }
                     }
                 }
@@ -511,7 +548,7 @@ impl Builder<'_> {
         out
     }
 
-    fn seg(&self, text: &str, s: InlineStyle, link: Option<usize>, base: Style) -> Seg {
+    fn seg(&self, text: &str, s: InlineStyle, link: Option<usize>, src: Option<Src>, base: Style) -> Seg {
         let t = self.env.theme;
         let mut st = base;
         let mut text = text.to_string();
@@ -542,7 +579,9 @@ impl Builder<'_> {
             st.fg = Some(if self.is_broken(link) { t.caution } else { t.link });
             st.underline = true;
         }
-        Seg { link, ..Seg::new(text, st) }
+        // Padded or remapped text no longer lines up byte for byte.
+        let src = if s.code || s.kbd || s.sup || s.sub { src.map(Src::inexact) } else { src };
+        Seg { link, src, ..Seg::new(text, st) }
     }
 
     fn is_broken(&self, link: Option<usize>) -> bool {
@@ -585,10 +624,10 @@ impl Builder<'_> {
                         used_first = true;
                     }
                 }
-                Piece::Image(cell, link) => {
+                Piece::Image(cell, link, src) => {
                     for row in 0..cell.rows {
-                        let seg =
-                            Seg { link, image: Some(ImageCell { row, ..cell }), ..Seg::new("", Style::default()) };
+                        let image = Some(ImageCell { row, ..cell });
+                        let seg = Seg { link, image, src, ..Seg::new("", Style::default()) };
                         self.push(if used_first { rest } else { first }, vec![seg]);
                         used_first = true;
                     }
@@ -601,17 +640,22 @@ impl Builder<'_> {
     }
 }
 
-fn append(cur: &mut Vec<Seg>, text: &str, like: &Seg) {
+/// Appends bytes `off..off + text.len()` of `like`'s text, merging with the
+/// previous segment when style, link and source position line up.
+fn append(cur: &mut Vec<Seg>, text: &str, like: &Seg, off: usize) {
+    let src = like.src.map(|s| s.slice(off, text.len(), like.text.len()));
     if let Some(last) = cur.last_mut()
         && last.image.is_none()
         && last.style == like.style
         && last.link == like.link
         && last.decor == like.decor
+        && let Some(joined) = Src::join(last.src, src)
     {
         last.text.push_str(text);
+        last.src = joined;
         return;
     }
-    cur.push(Seg { text: text.to_string(), image: None, ..like.clone() });
+    cur.push(Seg { text: text.to_string(), image: None, src, ..like.clone() });
 }
 
 fn finish(lines: &mut Vec<Vec<Seg>>, cur: &mut Vec<Seg>) {
@@ -620,7 +664,14 @@ fn finish(lines: &mut Vec<Vec<Seg>>, cur: &mut Vec<Seg>) {
             break;
         }
         let trimmed = last.text.trim_end_matches(' ').len();
+        let removed = last.text.len() - trimmed;
         last.text.truncate(trimmed);
+        if removed > 0
+            && let Some(s) = last.src.as_mut().filter(|s| s.exact)
+        {
+            s.end -= removed;
+            s.close = None;
+        }
         if last.text.is_empty() {
             cur.pop();
         } else {
@@ -657,6 +708,7 @@ pub fn wrap(segs: &[Seg], width: usize) -> Vec<Vec<Seg>> {
             } else {
                 rest.find([' ', '\n']).unwrap_or(rest.len())
             };
+            let tok_off = seg.text.len() - rest.len();
             let tok = &rest[..end];
             rest = &rest[end..];
             if first == '\n' {
@@ -670,7 +722,7 @@ pub fn wrap(segs: &[Seg], width: usize) -> Vec<Vec<Seg>> {
                     finish(&mut lines, &mut cur);
                     w = 0;
                 } else {
-                    append(&mut cur, tok, seg);
+                    append(&mut cur, tok, seg, tok_off);
                     w += tok.len();
                 }
             } else {
@@ -680,16 +732,16 @@ pub fn wrap(segs: &[Seg], width: usize) -> Vec<Vec<Seg>> {
                     w = 0;
                 }
                 if tw <= width {
-                    append(&mut cur, tok, seg);
+                    append(&mut cur, tok, seg, tok_off);
                     w += tw;
                 } else {
-                    for ch in tok.chars() {
+                    for (i, ch) in tok.char_indices() {
                         let cw = ch.width().unwrap_or(0);
                         if w + cw > width && w > 0 {
                             finish(&mut lines, &mut cur);
                             w = 0;
                         }
-                        append(&mut cur, ch.encode_utf8(&mut [0; 4]), seg);
+                        append(&mut cur, ch.encode_utf8(&mut [0; 4]), seg, tok_off + i);
                         w += cw;
                     }
                 }
@@ -707,13 +759,13 @@ fn hard_wrap(segs: &[Seg], width: usize) -> Vec<Vec<Seg>> {
     let mut lines = vec![Vec::new()];
     let mut w = 0;
     for seg in segs {
-        for ch in seg.text.chars() {
+        for (i, ch) in seg.text.char_indices() {
             let cw = ch.width().unwrap_or(0);
             if w + cw > width {
                 lines.push(Vec::new());
                 w = 0;
             }
-            append(lines.last_mut().unwrap(), ch.encode_utf8(&mut [0; 4]), seg);
+            append(lines.last_mut().unwrap(), ch.encode_utf8(&mut [0; 4]), seg, i);
             w += cw;
         }
     }

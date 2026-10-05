@@ -30,7 +30,7 @@ const HELP: &[(&str, &str)] = &[
     ("Enter", "follow focused link"),
     ("click", "follow link, jump via contents"),
     ("click code", "copy the code block"),
-    ("drag", "select text and copy it"),
+    ("drag", "select and copy as Markdown"),
     ("Backspace h", "go back"),
     ("/ n N", "search, next / previous match"),
     ("t", "toggle table of contents"),

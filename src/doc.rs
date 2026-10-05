@@ -4,7 +4,91 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use pulldown_cmark::{Alignment, BlockQuoteKind, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use std::ops::Range;
+
+use pulldown_cmark::{Alignment, BlockQuoteKind, CodeBlockKind, Event, OffsetIter, Options, Parser, Tag, TagEnd};
+
+/// Where a piece of rendered text came from in the Markdown source (byte
+/// offsets), so copying a selection can return the source instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Src {
+    pub start: usize,
+    pub end: usize,
+    /// The text has the same bytes as `source[start..end]`, so positions
+    /// inside it map 1:1. Otherwise only the span as a whole is known.
+    pub exact: bool,
+    /// Used instead of `start`/`end` when a selection begins at the first
+    /// (or ends at the last) character, to take enclosing markup with it:
+    /// `**`, backticks, `[`…`](url)`.
+    pub open: Option<usize>,
+    pub close: Option<usize>,
+}
+
+impl Src {
+    pub fn span(start: usize, end: usize) -> Src {
+        Src { start, end, exact: false, open: None, close: None }
+    }
+
+    /// Forgets the 1:1 mapping, for text that was transformed for display.
+    pub fn inexact(self) -> Src {
+        Src { exact: false, ..self }
+    }
+
+    /// The part covering bytes `off..off + len` of a text `total` bytes long.
+    pub fn slice(self, off: usize, len: usize, total: usize) -> Src {
+        let open = if off == 0 { self.open } else { None };
+        let close = if off + len == total { self.close } else { None };
+        if self.exact {
+            Src { start: self.start + off, end: self.start + off + len, exact: true, open, close }
+        } else {
+            Src { open, close, ..self }
+        }
+    }
+
+    /// Joins two adjacent spans, if they can be: both 1:1 and contiguous,
+    /// or the same opaque span. The outer `None` means they can't.
+    pub fn join(a: Option<Src>, b: Option<Src>) -> Option<Option<Src>> {
+        match (a, b) {
+            (None, None) => Some(None),
+            (Some(a), Some(b)) if a.exact && b.exact && a.end == b.start && b.open.is_none() => {
+                Some(Some(Src { end: b.end, close: b.close, ..a }))
+            }
+            (Some(a), Some(b)) if !a.exact && a == b => Some(Some(a)),
+            _ => None,
+        }
+    }
+
+    /// Source offset where a selection starting at byte `off` begins.
+    pub fn char_start(&self, off: usize) -> usize {
+        if self.exact && off > 0 { self.start + off } else { self.open.unwrap_or(self.start) }
+    }
+
+    /// Source offset where a selection ending with the char at `off..off + len` ends.
+    pub fn char_end(&self, off: usize, len: usize, total: usize) -> usize {
+        if !self.exact || off + len >= total {
+            self.close.unwrap_or(if self.exact { self.start + off + len } else { self.end })
+        } else {
+            self.start + off + len
+        }
+    }
+}
+
+/// Source positions of a code block: the whole block (fences included) and,
+/// per text chunk, `(offset in the code text, offset in the source)`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CodeSrc {
+    pub block: (usize, usize),
+    pub chunks: Vec<(usize, usize)>,
+}
+
+impl CodeSrc {
+    /// Source offset of byte `off` of the code text.
+    pub fn offset(&self, off: usize) -> Option<usize> {
+        let i = self.chunks.partition_point(|(t, _)| *t <= off).checked_sub(1)?;
+        let (t, s) = self.chunks[i];
+        Some(s + off - t)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InlineStyle {
@@ -24,11 +108,13 @@ pub enum Inline {
         text: String,
         style: InlineStyle,
         link: Option<usize>,
+        src: Option<Src>,
     },
     /// Index into `Doc::images`; `link` is set when the image is wrapped in a link.
     Image {
         idx: usize,
         link: Option<usize>,
+        src: Option<Src>,
     },
     Break,
 }
@@ -62,11 +148,13 @@ pub enum Block {
     Code {
         lang: String,
         text: String,
+        src: CodeSrc,
     },
     /// A Mermaid code block, rendered as the image `img`.
     Mermaid {
         img: usize,
         source: String,
+        src: CodeSrc,
     },
     Quote {
         kind: Option<BlockQuoteKind>,
@@ -81,14 +169,14 @@ pub enum Block {
         head: Vec<Vec<Inline>>,
         rows: Vec<Vec<Vec<Inline>>>,
     },
-    Rule,
+    Rule(usize, usize),
     Footnote {
         label: String,
         blocks: Vec<Block>,
     },
     DefTitle(Vec<Inline>),
     DefBody(Vec<Block>),
-    FrontMatter(String),
+    FrontMatter(String, CodeSrc),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -113,7 +201,11 @@ pub fn parse(src: &str) -> Doc {
         | Options::ENABLE_SUPERSCRIPT
         | Options::ENABLE_SUBSCRIPT;
     let mut p = P {
-        ev: Parser::new_ext(src, opts),
+        ev: Parser::new_ext(src, opts).into_offset_iter(),
+        source: src,
+        range: 0..0,
+        pending_open: None,
+        html_src: None,
         doc: Doc::default(),
         depth: Depths::default(),
         links: Vec::new(),
@@ -139,7 +231,15 @@ struct Depths {
 }
 
 struct P<'a> {
-    ev: Parser<'a>,
+    ev: OffsetIter<'a>,
+    source: &'a str,
+    /// Source range of the event last returned by `next`.
+    range: Range<usize>,
+    /// Start of an inline container (emphasis, link, …) whose first text
+    /// hasn't been pushed yet.
+    pending_open: Option<usize>,
+    /// Source span for text produced from raw HTML, which has no finer map.
+    html_src: Option<Src>,
     doc: Doc,
     depth: Depths,
     links: Vec<usize>,
@@ -147,7 +247,13 @@ struct P<'a> {
     slugs: HashMap<String, usize>,
 }
 
-impl P<'_> {
+impl<'a> P<'a> {
+    fn next(&mut self) -> Option<Event<'a>> {
+        let (e, r) = self.ev.next()?;
+        self.range = r;
+        Some(e)
+    }
+
     fn style(&self) -> InlineStyle {
         let d = &self.depth;
         InlineStyle {
@@ -175,7 +281,7 @@ impl P<'_> {
                 out.push(Block::Plain(std::mem::take(loose)));
             }
         };
-        while let Some(e) = self.ev.next() {
+        while let Some(e) = self.next() {
             match e {
                 Event::End(t) if stop(&t) => break,
                 Event::Start(Tag::Paragraph) => {
@@ -199,6 +305,7 @@ impl P<'_> {
                 }
                 Event::Start(Tag::CodeBlock(kind)) => {
                     flush(&mut loose, &mut out);
+                    let block = (self.range.start, self.range.end);
                     let lang = match kind {
                         CodeBlockKind::Fenced(info) => info
                             .split(|c: char| c.is_whitespace() || c == ',' || c == '{')
@@ -207,18 +314,18 @@ impl P<'_> {
                             .to_string(),
                         CodeBlockKind::Indented => String::new(),
                     };
-                    let text = self.collect_text(&|t| matches!(t, TagEnd::CodeBlock));
+                    let (text, chunks) = self.collect_code(&|t| matches!(t, TagEnd::CodeBlock));
                     if lang.eq_ignore_ascii_case("mermaid") {
-                        out.push(self.mermaid(text));
+                        out.push(self.mermaid(text, CodeSrc { block, chunks }));
                     } else {
-                        out.push(Block::Code { lang, text });
+                        out.push(Block::Code { lang, text, src: CodeSrc { block, chunks } });
                     }
                 }
                 Event::Start(Tag::List(start)) => {
                     flush(&mut loose, &mut out);
                     let mut items = Vec::new();
                     loop {
-                        match self.ev.next() {
+                        match self.next() {
                             Some(Event::Start(Tag::Item)) => {
                                 self.tasks.push(None);
                                 let blocks = self.blocks(&|t| matches!(t, TagEnd::Item));
@@ -237,9 +344,12 @@ impl P<'_> {
                 }
                 Event::Start(Tag::HtmlBlock) => {
                     flush(&mut loose, &mut out);
+                    let span = Src::span(self.range.start, self.range.end);
                     let html = self.collect_text(&|t| matches!(t, TagEnd::HtmlBlock));
                     let mut inl = Vec::new();
+                    self.html_src = Some(span);
                     self.html(&html, &mut inl);
+                    self.html_src = None;
                     trim_breaks(&mut inl);
                     if !inl.is_empty() {
                         out.push(Block::Paragraph(inl));
@@ -252,8 +362,9 @@ impl P<'_> {
                 }
                 Event::Start(Tag::MetadataBlock(_)) => {
                     flush(&mut loose, &mut out);
-                    let text = self.collect_text(&|t| matches!(t, TagEnd::MetadataBlock(_)));
-                    out.push(Block::FrontMatter(text));
+                    let block = (self.range.start, self.range.end);
+                    let (text, chunks) = self.collect_code(&|t| matches!(t, TagEnd::MetadataBlock(_)));
+                    out.push(Block::FrontMatter(text, CodeSrc { block, chunks }));
                 }
                 Event::Start(Tag::DefinitionList) => {
                     flush(&mut loose, &mut out);
@@ -272,7 +383,7 @@ impl P<'_> {
                 }
                 Event::Rule => {
                     flush(&mut loose, &mut out);
-                    out.push(Block::Rule);
+                    out.push(Block::Rule(self.range.start, self.range.end));
                 }
                 e => self.inline_event(e, &mut loose),
             }
@@ -281,9 +392,26 @@ impl P<'_> {
         out
     }
 
+    /// Like `collect_text`, also recording where each chunk sits in the source.
+    fn collect_code(&mut self, stop: &dyn Fn(&TagEnd) -> bool) -> (String, Vec<(usize, usize)>) {
+        let mut s = String::new();
+        let mut chunks = Vec::new();
+        while let Some(e) = self.next() {
+            match e {
+                Event::Text(t) => {
+                    chunks.push((s.len(), self.range.start));
+                    s.push_str(&t);
+                }
+                Event::End(t) if stop(&t) => break,
+                _ => {}
+            }
+        }
+        (s, chunks)
+    }
+
     fn collect_text(&mut self, stop: &dyn Fn(&TagEnd) -> bool) -> String {
         let mut s = String::new();
-        for e in self.ev.by_ref() {
+        while let Some(e) = self.next() {
             match e {
                 Event::Text(t) | Event::Html(t) | Event::InlineHtml(t) | Event::Code(t) => s.push_str(&t),
                 Event::SoftBreak | Event::HardBreak => s.push('\n'),
@@ -296,7 +424,7 @@ impl P<'_> {
 
     fn inlines(&mut self, stop: &dyn Fn(&TagEnd) -> bool) -> Vec<Inline> {
         let mut out = Vec::new();
-        while let Some(e) = self.ev.next() {
+        while let Some(e) = self.next() {
             match e {
                 Event::End(t) if stop(&t) => break,
                 e => self.inline_event(e, &mut out),
@@ -310,7 +438,7 @@ impl P<'_> {
         let mut rows = Vec::new();
         let mut row = Vec::new();
         loop {
-            match self.ev.next() {
+            match self.next() {
                 Some(Event::Start(Tag::TableHead)) | Some(Event::Start(Tag::TableRow)) => row = Vec::new(),
                 Some(Event::End(TagEnd::TableHead)) => head = std::mem::take(&mut row),
                 Some(Event::End(TagEnd::TableRow)) => rows.push(std::mem::take(&mut row)),
@@ -322,96 +450,180 @@ impl P<'_> {
         Block::Table { aligns, head, rows }
     }
 
-    fn push_text(&self, text: &str, style: InlineStyle, out: &mut Vec<Inline>) {
+    /// Source span of the current event's text, which pulldown-cmark gives
+    /// verbatim for plain text but wrapped in delimiters for code and math.
+    fn text_src(&mut self, text: &str) -> Src {
+        let r = self.range.clone();
+        let raw = &self.source[r.clone()];
+        let open = self.pending_open.take();
+        if raw == text {
+            return Src { start: r.start, end: r.end, exact: true, open, close: None };
+        }
+        match raw.find(text) {
+            Some(i) if !text.is_empty() => Src {
+                start: r.start + i,
+                end: r.start + i + text.len(),
+                exact: true,
+                open: open.or(Some(r.start)),
+                close: Some(r.end),
+            },
+            _ => Src { open: open.or(Some(r.start)), close: Some(r.end), ..Src::span(r.start, r.end) },
+        }
+    }
+
+    fn push_text(&self, text: &str, style: InlineStyle, out: &mut Vec<Inline>, src: Option<Src>) {
         if text.is_empty() {
             return;
         }
-        let text: String = text.chars().map(|c| if c == '\t' { ' ' } else { c }).filter(|c| !c.is_control()).collect();
+        let clean: String = text.chars().map(|c| if c == '\t' { ' ' } else { c }).filter(|c| !c.is_control()).collect();
+        let mut src = self.html_src.or(src);
+        if clean.len() != text.len() {
+            src = src.map(Src::inexact);
+        }
         let link = self.links.last().copied();
-        if let Some(Inline::Text { text: prev, style: s, link: l }) = out.last_mut()
+        if let Some(Inline::Text { text: prev, style: s, link: l, src: prev_src }) = out.last_mut()
             && *s == style
             && *l == link
+            && let Some(merged) = Src::join(*prev_src, src)
         {
-            prev.push_str(&text);
+            prev.push_str(&clean);
+            *prev_src = merged;
             return;
         }
-        out.push(Inline::Text { text, style, link });
+        out.push(Inline::Text { text: clean, style, link, src });
+    }
+
+    /// Records where the container just closed ends, on the last inline.
+    fn close_container(&self, out: &mut [Inline]) {
+        let end = self.range.end;
+        if let Some(Inline::Text { src: Some(s), .. } | Inline::Image { src: Some(s), .. }) = out.last_mut() {
+            s.close = Some(s.close.map_or(end, |c| c.max(end)));
+        }
     }
 
     fn inline_event(&mut self, e: Event, out: &mut Vec<Inline>) {
         match e {
-            Event::Text(t) => self.push_text(&t, self.style(), out),
+            Event::Text(t) => {
+                let src = self.text_src(&t);
+                self.push_text(&t, self.style(), out, Some(src));
+            }
             Event::Code(t) => {
                 let style = InlineStyle { code: true, ..self.style() };
-                self.push_text(&t, style, out);
+                let src = self.text_src(&t);
+                self.push_text(&t, style, out, Some(src));
             }
             Event::InlineMath(t) => {
                 let style = InlineStyle { math: true, ..self.style() };
-                self.push_text(&t, style, out);
+                let src = self.text_src(&t);
+                self.push_text(&t, style, out, Some(src));
             }
             Event::DisplayMath(t) => {
                 if !out.is_empty() {
                     out.push(Inline::Break);
                 }
                 let style = InlineStyle { math: true, ..self.style() };
+                let src = self.text_src(&t).inexact();
                 for (i, line) in t.trim().lines().enumerate() {
                     if i > 0 {
                         out.push(Inline::Break);
                     }
-                    self.push_text(&format!("  {line}"), style, out);
+                    self.push_text(&format!("  {line}"), style, out, Some(src));
                 }
                 out.push(Inline::Break);
             }
-            Event::Html(h) | Event::InlineHtml(h) => self.html(&h, out),
+            Event::Html(h) | Event::InlineHtml(h) => {
+                let outer = self.html_src;
+                self.html_src = outer.or(Some(Src::span(self.range.start, self.range.end)));
+                self.html(&h, out);
+                self.html_src = outer;
+            }
             Event::FootnoteReference(label) => {
                 let id = self.add_link(format!("#fn-{label}"));
-                out.push(Inline::Text { text: format!("[{label}]"), style: self.style(), link: Some(id) });
+                let src = Src { open: self.pending_open.take(), ..Src::span(self.range.start, self.range.end) };
+                out.push(Inline::Text {
+                    text: format!("[{label}]"),
+                    style: self.style(),
+                    link: Some(id),
+                    src: Some(src),
+                });
             }
-            Event::SoftBreak => self.push_text(" ", self.style(), out),
+            Event::SoftBreak => {
+                let r = self.range.clone();
+                let src = Src { exact: r.len() == 1, ..Src::span(r.start, r.end) };
+                self.push_text(" ", self.style(), out, Some(src));
+            }
             Event::HardBreak => out.push(Inline::Break),
             Event::TaskListMarker(done) => {
                 if let Some(t) = self.tasks.last_mut() {
                     *t = Some(done);
                 }
             }
-            Event::Start(tag) => match tag {
-                Tag::Emphasis => self.depth.italic += 1,
-                Tag::Strong => self.depth.bold += 1,
-                Tag::Strikethrough => self.depth.strike += 1,
-                Tag::Superscript => self.depth.sup += 1,
-                Tag::Subscript => self.depth.sub += 1,
-                Tag::Link { dest_url, .. } => {
-                    let id = self.add_link(dest_url.to_string());
-                    self.links.push(id);
+            Event::Start(tag) => {
+                if matches!(
+                    tag,
+                    Tag::Emphasis
+                        | Tag::Strong
+                        | Tag::Strikethrough
+                        | Tag::Superscript
+                        | Tag::Subscript
+                        | Tag::Link { .. }
+                ) {
+                    self.pending_open.get_or_insert(self.range.start);
                 }
-                Tag::Image { dest_url, .. } => {
-                    let alt = self.collect_text(&|t| matches!(t, TagEnd::Image));
-                    self.push_image(dest_url.to_string(), alt, out);
+                match tag {
+                    Tag::Emphasis => self.depth.italic += 1,
+                    Tag::Strong => self.depth.bold += 1,
+                    Tag::Strikethrough => self.depth.strike += 1,
+                    Tag::Superscript => self.depth.sup += 1,
+                    Tag::Subscript => self.depth.sub += 1,
+                    Tag::Link { dest_url, .. } => {
+                        let id = self.add_link(dest_url.to_string());
+                        self.links.push(id);
+                    }
+                    Tag::Image { dest_url, .. } => {
+                        let src = Src { open: self.pending_open.take(), ..Src::span(self.range.start, self.range.end) };
+                        let alt = self.collect_text(&|t| matches!(t, TagEnd::Image));
+                        self.push_image(dest_url.to_string(), alt, out, Some(src));
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
-            Event::End(tag) => match tag {
-                TagEnd::Emphasis => self.depth.italic = self.depth.italic.saturating_sub(1),
-                TagEnd::Strong => self.depth.bold = self.depth.bold.saturating_sub(1),
-                TagEnd::Strikethrough => self.depth.strike = self.depth.strike.saturating_sub(1),
-                TagEnd::Superscript => self.depth.sup = self.depth.sup.saturating_sub(1),
-                TagEnd::Subscript => self.depth.sub = self.depth.sub.saturating_sub(1),
-                TagEnd::Link => {
-                    self.links.pop();
+            }
+            Event::End(tag) => {
+                if matches!(
+                    tag,
+                    TagEnd::Emphasis
+                        | TagEnd::Strong
+                        | TagEnd::Strikethrough
+                        | TagEnd::Superscript
+                        | TagEnd::Subscript
+                        | TagEnd::Link
+                ) {
+                    self.close_container(out);
                 }
-                _ => {}
-            },
+                match tag {
+                    TagEnd::Emphasis => self.depth.italic = self.depth.italic.saturating_sub(1),
+                    TagEnd::Strong => self.depth.bold = self.depth.bold.saturating_sub(1),
+                    TagEnd::Strikethrough => self.depth.strike = self.depth.strike.saturating_sub(1),
+                    TagEnd::Superscript => self.depth.sup = self.depth.sup.saturating_sub(1),
+                    TagEnd::Subscript => self.depth.sub = self.depth.sub.saturating_sub(1),
+                    TagEnd::Link => {
+                        self.links.pop();
+                    }
+                    _ => {}
+                }
+            }
             _ => {}
         }
     }
 
-    fn push_image(&mut self, url: String, alt: String, out: &mut Vec<Inline>) {
+    fn push_image(&mut self, url: String, alt: String, out: &mut Vec<Inline>, src: Option<Src>) {
         let self_link = Some(self.add_link(url.clone()));
         self.doc.images.push(ImageRef { url, alt, self_link, mermaid: None });
-        out.push(Inline::Image { idx: self.doc.images.len() - 1, link: self.links.last().copied() });
+        let src = self.html_src.or(src);
+        out.push(Inline::Image { idx: self.doc.images.len() - 1, link: self.links.last().copied(), src });
     }
 
-    fn mermaid(&mut self, source: String) -> Block {
+    fn mermaid(&mut self, source: String, src: CodeSrc) -> Block {
         let mut hasher = DefaultHasher::new();
         source.hash(&mut hasher);
         self.doc.images.push(ImageRef {
@@ -420,7 +632,7 @@ impl P<'_> {
             self_link: None,
             mermaid: Some(source.clone()),
         });
-        Block::Mermaid { img: self.doc.images.len() - 1, source }
+        Block::Mermaid { img: self.doc.images.len() - 1, source, src }
     }
 
     /// Handles raw HTML: common formatting tags, `<img>`, `<a>`, and `<br>`
@@ -444,7 +656,7 @@ impl P<'_> {
             let text = decode_entities(&rest[..next]);
             let collapsed = collapse_ws(&text);
             if !collapsed.trim().is_empty() || (!collapsed.is_empty() && !out.is_empty()) {
-                self.push_text(&collapsed, self.style(), out);
+                self.push_text(&collapsed, self.style(), out, None);
             }
             rest = &rest[next..];
         }
@@ -483,7 +695,7 @@ impl P<'_> {
             "img" if !closing => {
                 if let Some(src) = attr(tag, "src") {
                     let alt = attr(tag, "alt").unwrap_or_default();
-                    self.push_image(src, alt, out);
+                    self.push_image(src, alt, out, None);
                 }
             }
             "a" if closing => {
@@ -616,6 +828,36 @@ mod tests {
         assert_eq!(items[0].task, Some(true));
         assert_eq!(items[1].task, Some(false));
         assert_eq!(doc.links, ["https://example.com"]);
+    }
+
+    #[test]
+    fn inline_source_spans() {
+        let src = "Some **bold** and `code` text.\n";
+        let doc = parse(src);
+        let Block::Paragraph(inl) = &doc.blocks[0] else { panic!() };
+        let spans: Vec<(&str, Src)> = inl
+            .iter()
+            .filter_map(
+                |i| if let Inline::Text { text, src: Some(s), .. } = i { Some((text.as_str(), *s)) } else { None },
+            )
+            .collect();
+        let bold = spans.iter().find(|(t, _)| *t == "bold").unwrap().1;
+        assert_eq!(&src[bold.start..bold.end], "bold");
+        assert_eq!(&src[bold.open.unwrap()..bold.close.unwrap()], "**bold**");
+        let code = spans.iter().find(|(t, _)| *t == "code").unwrap().1;
+        assert_eq!(&src[code.open.unwrap()..code.close.unwrap()], "`code`");
+    }
+
+    #[test]
+    fn code_blocks_map_lines_to_source() {
+        let src = "- item\n\n  ```rust\n  let a = 1;\n  let b = 2;\n  ```\n";
+        let doc = parse(src);
+        let Block::List { items, .. } = &doc.blocks[0] else { panic!() };
+        let Some(Block::Code { text, src: cs, .. }) = items[0].blocks.get(1) else { panic!("{:?}", items[0].blocks) };
+        let b = text.find("let b").unwrap();
+        let at = cs.offset(b).unwrap();
+        assert_eq!(&src[at..at + 5], "let b");
+        assert!(src[cs.block.0..cs.block.1].starts_with("```rust"));
     }
 
     #[test]
