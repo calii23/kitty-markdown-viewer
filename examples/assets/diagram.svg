@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="560" height="160" viewBox="0 0 560 160">
+  <rect width="560" height="160" rx="16" fill="#1e1e2e"/>
+  <g font-family="Helvetica, Arial, sans-serif" font-size="18" text-anchor="middle">
+    <rect x="24" y="50" width="140" height="60" rx="10" fill="#cba6f7"/>
+    <text x="94" y="86" fill="#1e1e2e">Markdown</text>
+    <rect x="210" y="50" width="140" height="60" rx="10" fill="#89b4fa"/>
+    <text x="280" y="86" fill="#1e1e2e">Layout</text>
+    <rect x="396" y="50" width="140" height="60" rx="10" fill="#a6e3a1"/>
+    <text x="466" y="86" fill="#1e1e2e">Terminal</text>
+  </g>
+  <g stroke="#cdd6f4" stroke-width="3" fill="#cdd6f4">
+    <line x1="164" y1="80" x2="200" y2="80"/><polygon points="200,73 210,80 200,87"/>
+    <line x1="350" y1="80" x2="386" y2="80"/><polygon points="386,73 396,80 386,87"/>
+  </g>
+</svg>
