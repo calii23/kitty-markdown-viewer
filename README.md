@@ -54,8 +54,11 @@ rendered page than a terminal dump. It's a single Rust binary that starts in abo
   same data in the other formats. The original is marked, and formats the data can't be expressed
   in are struck out (TOML has no `null`, for example).
 - **GitHub-flavored Markdown:** tables with alignment, task lists, strikethrough, footnotes,
-  alerts (`> [!NOTE]`, `[!TIP]`, `[!WARNING]`…), definition lists, math, front matter, and inline
-  HTML such as `<img>`, `<br>`, `<kbd>`, `<sub>` and `<sup>`.
+  alerts (`> [!NOTE]`, `[!TIP]`, `[!WARNING]`…), definition lists, math and front matter.
+- **HTML as GitHub shows it.** The HTML that READMEs use for layout is rendered, not dropped:
+  `align="center"` blocks (including `<div align="center">` around Markdown), `<h1>`–`<h6>`
+  headings in the contents, `<table>` with images in its cells, lists, `<details>`, `<pre>`,
+  `<img width>`, entities, and inline tags such as `<kbd>`, `<sub>`, `<sup>` and `<br>`.
 - **Themes** follow your terminal: `mdv` asks kitty for its background color and picks a light or
   dark palette (based on [Catppuccin](https://catppuccin.com)) that blends in.
 

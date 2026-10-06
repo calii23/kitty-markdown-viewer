@@ -6,7 +6,7 @@ use pulldown_cmark::{Alignment, BlockQuoteKind};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::convert::{Format, Variants};
-use crate::doc::{Block, CodeSrc, Doc, Inline, InlineStyle, Item, Src, plain_text};
+use crate::doc::{Block, CodeSrc, Doc, Inline, InlineStyle, Item, Length, Src, plain_text};
 use crate::highlight::Highlighter;
 use crate::kitty::{MAX_PLACEHOLDER_CELLS, Scale};
 use crate::style::Style;
@@ -253,7 +253,9 @@ impl Builder<'_> {
                 }
             }
             Block::List { start, items } => self.list(*start, items, first, rest, width, depth),
-            Block::Table { aligns, head, rows } => self.table(aligns, head, rows, first, rest, width),
+            Block::Table { aligns, head, rows, cell_aligns } => {
+                self.table(aligns, cell_aligns, head, rows, first, rest, width)
+            }
             Block::Rule(a, b) => {
                 let seg = Seg { src: Some(Src::span(*a, *b)), ..Seg::new("─".repeat(width), Style::fg(t.border)) };
                 self.push(first, vec![seg]);
@@ -274,6 +276,38 @@ impl Builder<'_> {
                 let f = concat(first, Seg::new("  → ", Style::fg(t.dim)));
                 let r = concat(rest, Seg::new("    ", Style::default()));
                 self.blocks(blocks, &f, &r, width.saturating_sub(4).max(4), depth);
+            }
+            Block::Center(blocks) => {
+                let start = self.out.lines.len();
+                self.blocks(blocks, first, rest, width, depth);
+                self.center(start, first.len(), rest.len(), width);
+            }
+        }
+    }
+
+    /// Centers lines `start..` in `width` by indenting each after its prefix
+    /// (`first` segments on the first line, `rest` on the others).
+    fn center(&mut self, start: usize, first: usize, rest: usize, width: usize) {
+        for (k, line) in self.out.lines[start..].iter_mut().enumerate() {
+            let (at, used) = match line.kind {
+                Kind::Text => {
+                    let at = if k == 0 { first } else { rest };
+                    (at, line.segs.iter().skip(at).map(Seg::width).sum::<usize>())
+                }
+                Kind::Heading { scale, prefix } => {
+                    let text: String =
+                        line.segs[prefix.min(line.segs.len())..].iter().map(|s| s.text.as_str()).collect();
+                    (prefix, scale.width(&text))
+                }
+                Kind::HeadingCont { .. } => continue,
+            };
+            let pad = width.saturating_sub(used) / 2;
+            if pad == 0 || used == 0 || line.segs.len() <= at {
+                continue;
+            }
+            line.segs.insert(at, Seg::decor(" ".repeat(pad), Style::default()));
+            if let Kind::Heading { prefix, .. } = &mut line.kind {
+                *prefix += 1;
             }
         }
     }
@@ -475,9 +509,11 @@ impl Builder<'_> {
         self.out.code_blocks.push(CodeSpan { start, end: self.out.lines.len(), text: code.to_string() });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn table(
         &mut self,
         aligns: &[Alignment],
+        cell_aligns: &[Vec<Alignment>],
         head: &[Vec<Inline>],
         rows: &[Vec<Vec<Inline>>],
         first: &[Seg],
@@ -489,25 +525,19 @@ impl Builder<'_> {
         if ncols == 0 {
             return;
         }
-        let cells = |b: &mut Self, row: &[Vec<Inline>], style: Style| -> Vec<Vec<Seg>> {
-            (0..ncols)
-                .map(|i| match row.get(i) {
-                    Some(inl) => b
-                        .pieces(inl, style, usize::MAX / 4, false)
-                        .into_iter()
-                        .flat_map(|p| if let Piece::Segs(s) = p { s } else { Vec::new() })
-                        .collect(),
-                    None => Vec::new(),
-                })
-                .collect()
-        };
-        let head_cells = cells(self, head, Style::default().bold());
-        let body_cells: Vec<_> = rows.iter().map(|r| cells(self, r, Style::default())).collect();
+        fn cells(row: &[Vec<Inline>], n: usize) -> Vec<&[Inline]> {
+            (0..n).map(|i| row.get(i).map_or(&[][..], Vec::as_slice)).collect()
+        }
+        let head_cells = cells(head, ncols);
+        let body_cells: Vec<_> = rows.iter().map(|r| cells(r, ncols)).collect();
+        let head_style = Style::default().bold();
 
         let mut natural = vec![1usize; ncols];
-        for row in std::iter::once(&head_cells).chain(body_cells.iter()) {
+        for (row, style) in
+            std::iter::once((&head_cells, head_style)).chain(body_cells.iter().map(|r| (r, Style::default())))
+        {
             for (i, cell) in row.iter().enumerate() {
-                for line in wrap(cell, usize::MAX / 4) {
+                for line in self.cell_lines(cell, style, MAX_PLACEHOLDER_CELLS as usize) {
                     natural[i] = natural[i].max(line.iter().map(Seg::width).sum());
                 }
             }
@@ -542,17 +572,19 @@ impl Builder<'_> {
             }
             vec![Seg::new(s, border)]
         };
-        let row_lines = |row: &[Vec<Seg>]| -> Vec<Vec<Seg>> {
-            let wrapped: Vec<Vec<Vec<Seg>>> = row.iter().zip(&widths).map(|(c, w)| wrap(c, *w)).collect();
+        let row_lines = |b: &Self, k: usize, row: &[&[Inline]], style: Style| -> Vec<Vec<Seg>> {
+            let wrapped: Vec<Vec<Vec<Seg>>> =
+                row.iter().zip(&widths).map(|(c, w)| b.cell_lines(c, style, *w)).collect();
             let height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
             (0..height)
-                .map(|k| {
+                .map(|y| {
                     let mut segs = vec![Seg::new("│", border)];
                     for (i, w) in widths.iter().enumerate() {
-                        let line = wrapped[i].get(k).cloned().unwrap_or_default();
+                        let line = wrapped[i].get(y).cloned().unwrap_or_default();
                         let used: usize = line.iter().map(Seg::width).sum();
                         let free = w.saturating_sub(used);
-                        let (l, r) = match aligns.get(i) {
+                        let cell = cell_aligns.get(k).and_then(|r| r.get(i)).filter(|a| **a != Alignment::None);
+                        let (l, r) = match cell.or(aligns.get(i)) {
                             Some(Alignment::Right) => (free, 0),
                             Some(Alignment::Center) => (free / 2, free - free / 2),
                             _ => (0, free),
@@ -569,17 +601,36 @@ impl Builder<'_> {
 
         self.push(first, hline("┌", "┬", "┐", "─"));
         if !head.is_empty() {
-            for l in row_lines(&head_cells) {
+            for l in row_lines(self, 0, &head_cells, head_style) {
                 self.push(rest, l);
             }
             self.push(rest, hline("╞", "╪", "╡", "═"));
         }
-        for row in &body_cells {
-            for l in row_lines(row) {
+        let skip = usize::from(!head.is_empty());
+        for (k, row) in body_cells.iter().enumerate() {
+            for l in row_lines(self, k + skip, row, Style::default()) {
                 self.push(rest, l);
             }
         }
         self.push(rest, hline("└", "┴", "┘", "─"));
+    }
+
+    /// Lines of a table cell `width` wide; images that fit are drawn.
+    fn cell_lines(&self, inl: &[Inline], style: Style, width: usize) -> Vec<Vec<Seg>> {
+        let mut lines = Vec::new();
+        for piece in self.pieces(inl, style, width, true) {
+            match piece {
+                Piece::Segs(segs) if segs.is_empty() => {}
+                Piece::Segs(segs) => lines.extend(wrap(&segs, width)),
+                Piece::Image(cell, link, src) => lines.extend((0..cell.rows).map(|row| {
+                    vec![Seg { link, src, image: Some(ImageCell { row, ..cell }), ..Seg::new("", Style::default()) }]
+                })),
+            }
+        }
+        if lines.is_empty() {
+            lines.push(Vec::new());
+        }
+        lines
     }
 
     /// Converts inlines to styled segments. Images that are loaded become
@@ -646,10 +697,19 @@ impl Builder<'_> {
             st.italic = true;
             st.fg = Some(t.math);
         }
-        if s.sup {
-            text = superscript(&text);
+        // Short runs like `x²` or `H₂O` use Unicode super/subscripts; longer
+        // text (`<sub>small print</sub>`) is dimmed instead.
+        let small = if s.sup {
+            superscript(&text)
         } else if s.sub {
-            text = subscript(&text);
+            subscript(&text)
+        } else {
+            None
+        };
+        match small {
+            Some(small) if !text.trim().contains(char::is_whitespace) => text = small,
+            _ if s.sup || s.sub => st.fg = Some(t.dim),
+            _ => {}
         }
         if link.is_some() {
             st.fg = Some(if self.is_broken(link) { t.caution } else { t.link });
@@ -670,9 +730,9 @@ impl Builder<'_> {
             return None;
         }
         let (cw, ch) = (self.env.cell.0 as f64, self.env.cell.1 as f64);
-        let (w, h) = (w as f64, h as f64);
         let max = MAX_PLACEHOLDER_CELLS as f64;
         let avail = (avail as f64).min(max);
+        let (w, h) = self.sized(idx, w as f64, h as f64, avail * cw);
         let cols_for_rows = |rows: f64| (rows * ch * w / h / cw).round().clamp(1.0, avail);
         let (cols, rows) = if h <= ch * 1.5 {
             (cols_for_rows(1.0), 1.0)
@@ -683,6 +743,31 @@ impl Builder<'_> {
             if rows > max_rows { (cols_for_rows(max_rows), max_rows) } else { (cols, rows) }
         };
         Some(ImageCell { img: idx, cols: cols as u16, rows: rows as u16, row: 0 })
+    }
+
+    /// Applies an image's HTML `width`/`height` to its pixel size `w`×`h`.
+    /// The attributes are in CSS pixels, while the cell size is in device
+    /// pixels, so they're scaled by a guess at the display's pixel ratio
+    /// (cells are rarely narrower than 6 or wider than 12 CSS pixels).
+    fn sized(&self, idx: usize, w: f64, h: f64, avail_px: f64) -> (f64, f64) {
+        let img = &self.doc.images[idx];
+        let ratio = (self.env.cell.0 as f64 / 10.0).round().max(1.0);
+        let px = |l: Length, of: f64| match l {
+            Length::Px(v) => v * ratio,
+            Length::Percent(p) => of * p / 100.0,
+        };
+        match (img.width, img.height) {
+            (Some(lw), Some(Length::Px(_))) => (px(lw, avail_px), px(img.height.unwrap(), 0.0)),
+            (Some(lw), _) => {
+                let nw = px(lw, avail_px);
+                (nw, h * nw / w)
+            }
+            (None, Some(lh @ Length::Px(_))) => {
+                let nh = px(lh, 0.0);
+                (w * nh / h, nh)
+            }
+            _ => (w, h),
+        }
     }
 
     fn flow(&mut self, pieces: Vec<Piece>, first: &[Seg], rest: &[Seg], width: usize) {
@@ -870,14 +955,12 @@ fn map_chars(s: &str, from: &str, to: &str) -> Option<String> {
     s.chars().map(|c| from.chars().position(|f| f == c).and_then(|i| to.chars().nth(i))).collect()
 }
 
-fn superscript(s: &str) -> String {
+fn superscript(s: &str) -> Option<String> {
     map_chars(s, "0123456789+-=()abcdefghijklmnoprstuvwxyz ", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ᵃᵇᶜᵈᵉᶠᵍʰⁱʲᵏˡᵐⁿᵒᵖʳˢᵗᵘᵛʷˣʸᶻ ")
-        .unwrap_or_else(|| format!("^{s}"))
 }
 
-fn subscript(s: &str) -> String {
+fn subscript(s: &str) -> Option<String> {
     map_chars(s, "0123456789+-=()aehijklmnoprstuvx ", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓ ")
-        .unwrap_or_else(|| format!("_{s}"))
 }
 
 #[cfg(test)]
@@ -909,7 +992,7 @@ mod tests {
 
     #[test]
     fn superscripts() {
-        assert_eq!(superscript("2"), "²");
-        assert_eq!(superscript("x!"), "^x!");
+        assert_eq!(superscript("2").as_deref(), Some("²"));
+        assert_eq!(superscript("x!"), None);
     }
 }

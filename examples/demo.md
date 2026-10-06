@@ -220,6 +220,48 @@ flowchart LR
 > [!CAUTION]
 > Advises about risks or negative outcomes.
 
+## HTML
+
+Block-level HTML, as found in many GitHub READMEs, is laid out too:
+
+<p align="center">
+  <img src="assets/badge.svg" alt="badge"> <img src="assets/badge.svg" alt="badge"><br>
+  <strong>Centered</strong> text &mdash; with entities &amp; a line break<br>
+  <sub>and small print underneath</sub>
+</p>
+
+<div align="center">
+
+### A centered Markdown heading
+
+Markdown inside `<div align="center">` is centered as well.
+
+</div>
+
+<table>
+  <thead>
+    <tr><th>Element</th><th align="center">Becomes</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>&lt;h1&gt;</code>…<code>&lt;h6&gt;</code></td><td align="center">headings in the contents</td></tr>
+    <tr><td><code>&lt;table&gt;</code></td><td align="center">a table, images included</td></tr>
+    <tr><td><code>&lt;ul&gt;</code>, <code>&lt;ol&gt;</code></td><td align="center">lists</td></tr>
+  </tbody>
+</table>
+
+<details>
+<summary>Details are shown expanded</summary>
+<ol>
+  <li><input type="checkbox" checked disabled> HTML lists</li>
+  <li><input type="checkbox" disabled> with checkboxes</li>
+</ol>
+</details>
+
+<pre lang="rust"><code>fn main() {
+    println!("&lt;pre&gt; blocks are highlighted");
+}
+</code></pre>
+
 ## Definition lists
 
 Kitty

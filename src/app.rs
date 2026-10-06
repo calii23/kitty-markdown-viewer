@@ -791,7 +791,9 @@ fn collect_anchors(blocks: &[Block], images: &[ImageRef], out: &mut HashMap<Stri
                 out.insert(format!("fn-{label}"), format!("Footnote {label}"));
                 collect_anchors(blocks, images, out);
             }
-            Block::Quote { blocks, .. } | Block::DefBody(blocks) => collect_anchors(blocks, images, out),
+            Block::Quote { blocks, .. } | Block::DefBody(blocks) | Block::Center(blocks) => {
+                collect_anchors(blocks, images, out)
+            }
             Block::List { items, .. } => items.iter().for_each(|i| collect_anchors(&i.blocks, images, out)),
             _ => {}
         }
@@ -1024,9 +1026,10 @@ fn visit_headings(blocks: &[Block], images: &[ImageRef], f: &mut dyn FnMut(u8, &
     for b in blocks {
         match b {
             Block::Heading { level, inlines, .. } => f(*level, &doc::plain_text(inlines, images)),
-            Block::Quote { blocks, .. } | Block::Footnote { blocks, .. } | Block::DefBody(blocks) => {
-                visit_headings(blocks, images, f)
-            }
+            Block::Quote { blocks, .. }
+            | Block::Footnote { blocks, .. }
+            | Block::DefBody(blocks)
+            | Block::Center(blocks) => visit_headings(blocks, images, f),
             Block::List { items, .. } => items.iter().for_each(|i| visit_headings(&i.blocks, images, f)),
             _ => {}
         }
