@@ -1,8 +1,18 @@
 [package]
-name = "tui-markdown-viewer"
+name = "kitty-markdown-viewer"
 version = "0.1.0"
 edition = "2024"
-description = "Full-screen Markdown viewer for kitty with images, scaled headings and a table of contents"
+rust-version = "1.88"
+description = "A full-screen Markdown viewer for the kitty terminal: inline images, big headings, Mermaid diagrams and clickable links"
+license = "MIT"
+repository = "https://github.com/calii23/kitty-markdown-viewer"
+homepage = "https://github.com/calii23/kitty-markdown-viewer"
+readme = "README.md"
+keywords = ["kitty", "markdown", "terminal", "viewer", "tui"]
+categories = ["command-line-utilities", "text-processing"]
+# The demo video and screenshots are for GitHub, not the published crate
+# (crates.io rejects packages over 10 MB).
+exclude = ["docs/", ".claude/"]
 
 [[bin]]
 name = "mdv"
@@ -22,7 +32,10 @@ libc = "0.2.189"
 mermaid-rs-renderer = { version = "0.3.1", default-features = false }
 pulldown-cmark = "0.13.4"
 resvg = "0.48.1"
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+toml = { version = "1.1.6", features = ["preserve_order"] }
 two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"] }
 unicode-width = "0.2.2"
 ureq = "3.4.2"
+yaml_serde = "0.10.7"

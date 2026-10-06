@@ -30,6 +30,7 @@ const HELP: &[(&str, &str)] = &[
     ("Enter", "follow focused link"),
     ("click", "follow link, jump via contents"),
     ("click code", "copy the code block"),
+    ("click tab", "convert JSON / YAML / TOML"),
     ("drag", "select and copy as Markdown"),
     ("Backspace h", "go back"),
     ("/ n N", "search, next / previous match"),
@@ -72,6 +73,10 @@ impl App {
             }
             let li = self.scroll + y as usize;
             let Some(line) = self.layout.lines.get(li) else { continue };
+            for (i, tab) in self.layout.tabs.iter().enumerate().filter(|(_, t)| t.line == li) {
+                let (x0, x1) = (g.content_x + tab.x0 as u16, g.content_x + tab.x1 as u16);
+                self.hits.push(Hit { y, x0, x1, target: HitTarget::Tab(i) });
+            }
             goto(&mut buf, y, g.content_x);
             match line.kind {
                 Kind::Text => self.draw_segs(&mut buf, &mut pre, li, &line.segs.clone(), y, g.content_x),
