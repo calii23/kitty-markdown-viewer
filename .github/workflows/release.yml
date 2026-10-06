@@ -1,0 +1,120 @@
+# Builds release binaries and publishes a GitHub release when a version tag
+# is pushed:
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# The tag must match the version in Cargo.toml. The release is created as a
+# draft, each build uploads its archive to it, and it's published once all
+# required builds succeed. If a build fails, the draft stays unpublished.
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  create-release:
+    name: Create draft release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match version $version in Cargo.toml"
+            exit 1
+          fi
+
+      - name: Create draft release
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --draft --verify-tag --generate-notes \
+            --title "Kitty Markdown Viewer $GITHUB_REF_NAME"
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    # FreeBSD is best effort: a failure there doesn't hold back the release.
+    continue-on-error: ${{ matrix.optional }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS (Apple silicon)
+            target: aarch64-apple-darwin
+            os: macos-latest
+            optional: false
+          - name: macOS (Intel)
+            target: x86_64-apple-darwin
+            os: macos-latest
+            optional: false
+          - name: Linux (x86_64)
+            target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            optional: false
+          - name: Linux (ARM64)
+            target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            optional: false
+          - name: FreeBSD (x86_64)
+            target: x86_64-unknown-freebsd
+            os: ubuntu-latest
+            optional: true
+            cross: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          rustup default stable
+
+      # Static musl binaries run on any Linux distribution. ring (via rustls)
+      # has C code, so it needs musl's C compiler.
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
+      - name: Build
+        run: ${{ matrix.cross && 'cross' || 'cargo' }} build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        id: package
+        run: |
+          name="mdv-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/mdv" README.md LICENSE "$name/"
+          tar -czf "$name.tar.gz" "$name"
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          else
+            shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          fi
+          echo "archive=$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to the release
+        run: |
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            "${{ steps.package.outputs.archive }}" "${{ steps.package.outputs.archive }}.sha256"
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the draft
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use pulldown_cmark::{Alignment, BlockQuoteKind};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::convert::{Format, Variants};
 use crate::doc::{Block, CodeSrc, Doc, Inline, InlineStyle, Item, Src, plain_text};
 use crate::highlight::Highlighter;
 use crate::kitty::{MAX_PLACEHOLDER_CELLS, Scale};
@@ -98,12 +99,27 @@ pub struct CodeSpan {
     pub text: String,
 }
 
+/// A clickable format tab in a data code block's header.
+#[derive(Clone, Debug)]
+pub struct Tab {
+    pub line: usize,
+    /// Columns `x0..x1` relative to the text column.
+    pub x0: usize,
+    pub x1: usize,
+    pub block: usize,
+    pub format: Format,
+    pub source: Format,
+    /// Why the block can't be shown in this format.
+    pub error: Option<String>,
+}
+
 #[derive(Default)]
 pub struct Layout {
     pub lines: Vec<Line>,
     pub headings: Vec<HeadingEntry>,
     pub anchors: HashMap<String, usize>,
     pub code_blocks: Vec<CodeSpan>,
+    pub tabs: Vec<Tab>,
 }
 
 pub struct Env<'a> {
@@ -114,6 +130,8 @@ pub struct Env<'a> {
     pub image_dims: &'a dyn Fn(usize) -> Option<(u32, u32)>,
     pub cell: (u16, u16),
     pub max_image_rows: usize,
+    /// Format a data code block (by id) is shown in, if switched.
+    pub code_format: &'a dyn Fn(usize) -> Option<Format>,
     /// Why an image failed to load, by `Doc::images` index.
     pub image_error: &'a dyn Fn(usize) -> Option<String>,
     /// Per link id: true when the target is a missing file or anchor.
@@ -186,7 +204,10 @@ impl Builder<'_> {
                 self.flow(pieces, first, rest, width);
             }
             Block::Heading { level, inlines, anchor } => self.heading(*level, inlines, anchor, first, rest, width),
-            Block::Code { lang, text, src } => self.code(lang, text, lang, Some(src), first, rest, width),
+            Block::Code { lang, text, src, id, variants } => {
+                let data = variants.as_ref().map(|v| (*id, v));
+                self.code(lang, text, lang, Some(src), data, first, rest, width)
+            }
             Block::Mermaid { img, source, src } => match self.image_cell(*img, width) {
                 Some(cell) => {
                     let start = self.out.lines.len();
@@ -204,10 +225,12 @@ impl Builder<'_> {
                         Some(e) => format!("mermaid · ✖ {e}"),
                         None => "mermaid".to_string(),
                     };
-                    self.code("mermaid", source, &label, Some(src), first, rest, width);
+                    self.code("mermaid", source, &label, Some(src), None, first, rest, width);
                 }
             },
-            Block::FrontMatter(text, src) => self.code("yaml", text, "front matter", Some(src), first, rest, width),
+            Block::FrontMatter(text, src) => {
+                self.code("yaml", text, "front matter", Some(src), None, first, rest, width)
+            }
             Block::Quote { kind, blocks } => {
                 let (color, title) = match kind {
                     Some(BlockQuoteKind::Note) => (t.note, Some("ⓘ Note")),
@@ -345,6 +368,7 @@ impl Builder<'_> {
         text: &str,
         label: &str,
         src: Option<&CodeSrc>,
+        data: Option<(usize, &Variants)>,
         first: &[Seg],
         rest: &[Seg],
         width: usize,
@@ -352,6 +376,17 @@ impl Builder<'_> {
         let t = self.env.theme;
         let bg = t.code_bg;
         let inner = width.saturating_sub(2).max(1);
+        // Data blocks may be shown converted. Converted text isn't in the
+        // source, so it has no source mapping.
+        let shown = data.map(|(id, v)| (self.env.code_format)(id).unwrap_or(v.source));
+        let converted = match (data, shown) {
+            (Some((_, v)), Some(f)) if f != v.source => v.get(f).clone().ok(),
+            _ => None,
+        };
+        let (text, lang, src) = match (&converted, shown) {
+            (Some(c), Some(f)) => (c.as_str(), f.lang(), None),
+            _ => (text, lang, src),
+        };
         let pad = |segs: Vec<Seg>| {
             let used: usize = segs.iter().map(Seg::width).sum();
             let mut v = vec![Seg::decor(" ", Style::default().on(bg))];
@@ -360,10 +395,51 @@ impl Builder<'_> {
             v
         };
         let start = self.out.lines.len();
-        let label = truncate(label, inner);
         let hint = "⧉ click to copy";
-        let mut header = vec![Seg::decor(label.clone(), Style::fg(t.dim).italic().on(bg))];
-        let free = inner.saturating_sub(label.width());
+        let mut header = Vec::new();
+        let mut used = 0;
+        match (data, shown) {
+            (Some((id, v)), Some(shown)) => {
+                // Tabs: the active one highlighted, unavailable ones struck out.
+                let line = self.out.lines.len();
+                let x0 = first.iter().map(Seg::width).sum::<usize>() + 1;
+                let wide = inner >= 34;
+                for f in Format::ALL {
+                    let error = v.get(f).as_ref().err().cloned();
+                    let text = match (f == v.source, wide) {
+                        (true, true) => format!(" {} (source) ", f.label()),
+                        (true, false) => format!(" {}• ", f.label()),
+                        (false, _) => format!(" {} ", f.label()),
+                    };
+                    let style = if f == shown {
+                        Style::fg(t.on_accent).on(t.accent).bold()
+                    } else if error.is_none() {
+                        Style::fg(t.fg).on(t.border)
+                    } else {
+                        Style { strike: true, ..Style::fg(t.dim).on(bg) }
+                    };
+                    let w = text.width();
+                    self.out.tabs.push(Tab {
+                        line,
+                        x0: x0 + used,
+                        x1: x0 + used + w,
+                        block: id,
+                        format: f,
+                        source: v.source,
+                        error,
+                    });
+                    header.push(Seg::decor(text, style));
+                    header.push(Seg::decor(" ", Style::default().on(bg)));
+                    used += w + 1;
+                }
+            }
+            _ => {
+                let label = truncate(label, inner);
+                used = label.width();
+                header.push(Seg::decor(label, Style::fg(t.dim).italic().on(bg)));
+            }
+        }
+        let free = inner.saturating_sub(used);
         if free > hint.width() + 2 {
             header.push(Seg::decor(" ".repeat(free - hint.width()), Style::default().on(bg)));
             header.push(Seg::decor(hint, Style::fg(t.dim).on(bg)));

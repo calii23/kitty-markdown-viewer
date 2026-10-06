@@ -8,6 +8,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, Mou
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::clipboard;
+use crate::convert::Format;
 use crate::doc::{self, Block, Doc, ImageRef};
 use crate::highlight::Highlighter;
 use crate::images::Images;
@@ -67,6 +68,8 @@ pub struct Search {
 pub enum HitTarget {
     Link(usize),
     Toc(usize),
+    /// Index into `Layout::tabs`.
+    Tab(usize),
 }
 
 #[derive(Clone, Copy)]
@@ -163,6 +166,8 @@ pub struct App {
     /// Resolution of each `doc.links` entry.
     pub link_info: Vec<LinkInfo>,
     pub hover: Option<Hover>,
+    /// Format each data code block (by id) is shown in, when switched.
+    formats: HashMap<usize, Format>,
     pub selection: Option<Selection>,
     press: Option<Press>,
     /// Last drag position, and -1/1 while it sits on the top/bottom edge.
@@ -202,6 +207,7 @@ impl App {
             link_order: Vec::new(),
             link_info: Vec::new(),
             hover: None,
+            formats: HashMap::new(),
             selection: None,
             press: None,
             drag: (0, 0, 0),
@@ -226,6 +232,9 @@ impl App {
     }
 
     fn load(&mut self, source: Source) {
+        if source.path != self.source.path || source.path.is_none() {
+            self.formats.clear();
+        }
         self.doc = doc::parse(&source.text);
         let base = source.base_dir();
         self.image_keys = self.doc.images.iter().map(|i| Images::resolve(&i.url, &base)).collect();
@@ -274,6 +283,8 @@ impl App {
         let (keys, images) = (&self.image_keys, &self.images);
         let dims = |i: usize| images.dims(&keys[i]);
         let errors = |i: usize| images.error(&keys[i]);
+        let formats = &self.formats;
+        let code_format = |id: usize| formats.get(&id).copied();
         let broken: Vec<bool> = self.link_info.iter().map(|l| l.broken).collect();
         let env = Env {
             theme: &self.theme,
@@ -283,6 +294,7 @@ impl App {
             cell: self.caps.cell,
             max_image_rows: (g.rows as usize).saturating_sub(3),
             image_error: &errors,
+            code_format: &code_format,
             broken_links: &broken,
         };
         self.layout = layout::layout(&self.doc, g.content_w as usize, &env);
@@ -806,6 +818,20 @@ impl App {
                 let line = self.layout.headings[i].line;
                 self.jump_to_line(line);
             }
+            Some(HitTarget::Tab(i)) => {
+                let tab = self.layout.tabs[i].clone();
+                if let Some(e) = tab.error {
+                    self.set_message(format!("Can't show as {}: {e}", tab.format.label()));
+                    return;
+                }
+                self.formats.insert(tab.block, tab.format);
+                self.relayout();
+                self.set_message(if tab.format == tab.source {
+                    format!("Showing the original {}", tab.format.label())
+                } else {
+                    format!("Showing as {} (converted from {})", tab.format.label(), tab.source.label())
+                });
+            }
             None if press.in_content => {
                 let line = press.pos.line;
                 let Some(block) = self.layout.code_blocks.iter().find(|b| (b.start..b.end).contains(&line)).cloned()
@@ -1056,6 +1082,20 @@ mod tests {
 
         let table = "| A | B |\n|---|---|\n| 1 | 2 |\n";
         assert_eq!(copy_between(table, "A", "2"), table.trim_end());
+    }
+
+    #[test]
+    fn data_blocks_switch_format() {
+        let mut app = app("```json\n{\"name\": \"mdv\", \"tags\": [\"a\"], \"gone\": null}\n```\n");
+        let labels: Vec<_> = app.layout.tabs.iter().map(|t| (t.format, t.error.is_some())).collect();
+        assert_eq!(labels, [(Format::Json, false), (Format::Yaml, false), (Format::Toml, true)]);
+        assert!(app.layout.lines[0].plain().contains("JSON (source)"));
+
+        app.formats.insert(0, Format::Yaml);
+        app.relayout();
+        let text: Vec<String> = app.layout.lines.iter().map(|l| l.plain()).collect();
+        assert!(text.iter().any(|l| l.trim() == "name: mdv"), "{text:#?}");
+        assert_eq!(app.layout.code_blocks[0].text, "name: mdv\ntags:\n- a\ngone: null");
     }
 
     #[test]

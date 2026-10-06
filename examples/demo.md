@@ -1,9 +1,9 @@
 ---
-title: mdv feature tour
+title: Kitty Markdown Viewer feature tour
 tags: [markdown, kitty, terminal]
 ---
 
-# mdv feature tour
+# Kitty Markdown Viewer feature tour
 
 ![build](assets/badge.svg) ![build](assets/badge.svg)
 
@@ -27,7 +27,7 @@ work too, and so do raw <b>HTML</b> <i>tags</i> and line<br>breaks.
 - Autolink: <https://www.rust-lang.org>
 - Email: <hello@example.com>
 - Hover any link to see where it goes. Broken links are red.
-- Same document: [back to the top](#mdv-feature-tour), [Code](#code)
+- Same document: [back to the top](#kitty-markdown-viewer-feature-tour), [Code](#code)
 - Other Markdown file: [other.md](other.md) (press Backspace to come back)
 - Local non-Markdown file: [the PNG](assets/gradient.png) opens in Preview
 - Missing target: [nowhere](does-not-exist.md)
@@ -117,7 +117,7 @@ model User {
 
 ```toml
 [package]
-name = "mdv"
+name = "kitty-markdown-viewer"
 edition = "2024"
 ```
 
@@ -130,6 +130,25 @@ edition = "2024"
 for file in *.md
     mdv $file
 end
+```
+
+Data blocks (JSON, YAML, TOML) have tabs to view them converted:
+
+```json
+{
+  "name": "mdv",
+  "version": "0.1.0",
+  "features": ["images", "headings", "mermaid"],
+  "terminal": { "name": "kitty", "protocols": 3 }
+}
+```
+
+```yaml
+# TOML has no null, so that tab is unavailable here
+server:
+  host: localhost
+  port: 8080
+  proxy: null
 ```
 
     Indented code block without a language.

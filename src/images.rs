@@ -198,7 +198,7 @@ fn fetch(key: &str) -> Result<Vec<u8>, String> {
             ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(20))).build().into();
         return agent
             .get(key)
-            .header("User-Agent", concat!("mdv/", env!("CARGO_PKG_VERSION")))
+            .header("User-Agent", concat!("kitty-markdown-viewer/", env!("CARGO_PKG_VERSION")))
             .call()
             .and_then(|mut r| r.body_mut().read_to_vec())
             .map_err(|e| e.to_string());

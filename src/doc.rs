@@ -6,6 +6,7 @@ use std::hash::{Hash, Hasher};
 
 use std::ops::Range;
 
+use crate::convert::{Format, Variants};
 use pulldown_cmark::{Alignment, BlockQuoteKind, CodeBlockKind, Event, OffsetIter, Options, Parser, Tag, TagEnd};
 
 /// Where a piece of rendered text came from in the Markdown source (byte
@@ -149,6 +150,10 @@ pub enum Block {
         lang: String,
         text: String,
         src: CodeSrc,
+        /// Distinguishes blocks, e.g. to remember which format one is shown in.
+        id: usize,
+        /// JSON/YAML/TOML blocks that parse, with their conversions.
+        variants: Option<Variants>,
     },
     /// A Mermaid code block, rendered as the image `img`.
     Mermaid {
@@ -206,6 +211,7 @@ pub fn parse(src: &str) -> Doc {
         range: 0..0,
         pending_open: None,
         html_src: None,
+        code_blocks: 0,
         doc: Doc::default(),
         depth: Depths::default(),
         links: Vec::new(),
@@ -240,6 +246,8 @@ struct P<'a> {
     pending_open: Option<usize>,
     /// Source span for text produced from raw HTML, which has no finer map.
     html_src: Option<Src>,
+    /// Code blocks seen so far, for their ids.
+    code_blocks: usize,
     doc: Doc,
     depth: Depths,
     links: Vec<usize>,
@@ -318,7 +326,10 @@ impl<'a> P<'a> {
                     if lang.eq_ignore_ascii_case("mermaid") {
                         out.push(self.mermaid(text, CodeSrc { block, chunks }));
                     } else {
-                        out.push(Block::Code { lang, text, src: CodeSrc { block, chunks } });
+                        let id = self.code_blocks;
+                        self.code_blocks += 1;
+                        let variants = Format::from_lang(&lang).and_then(|f| Variants::new(f, &text));
+                        out.push(Block::Code { lang, text, src: CodeSrc { block, chunks }, id, variants });
                     }
                 }
                 Event::Start(Tag::List(start)) => {
