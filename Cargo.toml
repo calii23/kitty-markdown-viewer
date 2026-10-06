@@ -1,6 +1,6 @@
 [package]
 name = "kitty-markdown-viewer"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A full-screen Markdown viewer for the kitty terminal: inline images, big headings, Mermaid diagrams and clickable links"
