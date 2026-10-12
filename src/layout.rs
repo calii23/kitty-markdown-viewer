@@ -73,6 +73,51 @@ pub struct Line {
 }
 
 impl Line {
+    /// Where each character is drawn: `(segment, byte offset, column, width)`.
+    /// An image segment is one entry. Scaled heading text takes its scaled
+    /// width, and characters packed into one OSC 66 chunk share its columns.
+    pub fn char_cols(&self) -> Vec<(usize, usize, usize, usize)> {
+        let (scale, prefix) = match self.kind {
+            Kind::Heading { scale, prefix } => (scale, prefix),
+            _ => (Scale::ONE, usize::MAX),
+        };
+        let mut out = Vec::new();
+        let mut col = 0;
+        for (si, seg) in self.segs.iter().enumerate().take(prefix) {
+            if let Some(cell) = seg.image {
+                out.push((si, 0, col, cell.cols as usize));
+                col += cell.cols as usize;
+                continue;
+            }
+            for (off, ch) in seg.text.char_indices() {
+                let w = ch.width().unwrap_or(0);
+                out.push((si, off, col, w));
+                col += w;
+            }
+        }
+        if prefix >= self.segs.len() {
+            return out;
+        }
+        // Heading text: walk the drawing units over the joined segments.
+        let chars: Vec<(usize, usize, usize)> = self.segs[prefix..]
+            .iter()
+            .enumerate()
+            .flat_map(|(i, seg)| seg.text.char_indices().map(move |(off, ch)| (prefix + i, off, ch.len_utf8())))
+            .collect();
+        let text: String = self.segs[prefix..].iter().map(|s| s.text.as_str()).collect();
+        let mut chars = chars.into_iter();
+        for (bytes, w) in scale.units(&text) {
+            let mut left = bytes;
+            while left > 0 {
+                let Some((si, off, len)) = chars.next() else { break };
+                out.push((si, off, col, w));
+                left = left.saturating_sub(len);
+            }
+            col += w;
+        }
+        out
+    }
+
     pub fn plain(&self) -> String {
         self.segs
             .iter()

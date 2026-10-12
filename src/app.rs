@@ -15,6 +15,7 @@ use crate::images::Images;
 use crate::layout::{self, Env, Kind, Layout};
 use crate::links::{self, Target, percent_decode};
 use crate::probe::Caps;
+use crate::state::{self, State};
 use crate::theme::Theme;
 
 #[derive(Clone)]
@@ -149,7 +150,15 @@ pub struct Options {
     pub toc: bool,
     /// Optional cap on the text column width; `None` fills the window.
     pub max_width: Option<u16>,
+    /// Contents width the user dragged to; `None` fits the headings.
+    pub toc_width: Option<u16>,
+    /// Remember contents visibility and width across runs.
+    pub persist: bool,
 }
+
+/// Narrowest contents column, and the least text width it leaves.
+const MIN_TOC: u16 = 12;
+const MIN_TEXT: u16 = 40;
 
 pub struct App {
     pub caps: Caps,
@@ -177,9 +186,17 @@ pub struct App {
     reply: Option<(String, Instant)>,
     /// Escape sequences (clipboard writes) to emit with the next frame.
     pub pending: String,
+    /// Contents width that fits this document's headings.
     pub toc_width: u16,
     pub scroll: usize,
     pub toc_scroll: usize,
+    /// Heading the contents was last scrolled to follow, so scrolling the
+    /// contents by hand sticks until the reading position moves on.
+    pub toc_followed: Option<Option<usize>>,
+    /// Dragging the contents border.
+    resizing: bool,
+    /// Mouse pointer shape last set with OSC 22.
+    cursor: &'static str,
     pub size: (u16, u16),
     pub opts: Options,
     pub focus: Option<usize>,
@@ -217,6 +234,9 @@ impl App {
             toc_width: 0,
             scroll: 0,
             toc_scroll: 0,
+            toc_followed: None,
+            resizing: false,
+            cursor: "default",
             size,
             opts,
             focus: None,
@@ -258,6 +278,7 @@ impl App {
         self.press = None;
         self.scroll = 0;
         self.toc_scroll = 0;
+        self.toc_followed = None;
         self.relayout();
         if !self.search.query.is_empty() {
             self.run_search();
@@ -267,7 +288,11 @@ impl App {
     pub fn geometry(&self) -> Geometry {
         let (w, h) = self.size;
         let rows = h.saturating_sub(1).max(1);
-        let toc_w = if self.opts.toc && self.toc_width > 0 && w >= 72 { self.toc_width.min(w / 3) } else { 0 };
+        let toc_w = match self.opts.toc_width {
+            _ if !self.opts.toc || self.toc_width == 0 || w < 72 => 0,
+            Some(custom) => custom.min(w.saturating_sub(MIN_TEXT)).max(MIN_TOC),
+            None => self.toc_width.min(w / 3),
+        };
         let content_x = if toc_w > 0 { toc_w + 3 } else { 2 };
         let content_w = w.saturating_sub(content_x + 2).min(self.opts.max_width.unwrap_or(u16::MAX)).max(12);
         Geometry { toc_w, content_x, content_w, rows }
@@ -628,6 +653,7 @@ impl App {
             KeyCode::Char('t') => {
                 self.opts.toc = !self.opts.toc;
                 self.relayout();
+                self.save_state();
             }
             KeyCode::Tab => self.focus_step(true),
             KeyCode::BackTab => self.focus_step(false),
@@ -660,7 +686,79 @@ impl App {
     }
 
     fn mouse(&mut self, m: MouseEvent) -> bool {
+        let redraw = self.mouse_action(m);
+        let shape = self.cursor_shape(m.column, m.row);
+        if shape == self.cursor {
+            return redraw;
+        }
+        self.cursor = shape;
+        self.push_cursor();
+        true
+    }
+
+    /// Queues OSC 22 for the current pointer shape.
+    fn push_cursor(&mut self) {
+        let seq = format!("\x1b]22;{}\x1b\\", self.cursor);
+        if self.caps.tmux {
+            self.pending.push_str(&format!("\x1bPtmux;{}\x1b\\", seq.replace('\x1b', "\x1b\x1b")));
+        } else {
+            self.pending.push_str(&seq);
+        }
+    }
+
+    /// Resets the pointer shape, for leaving the viewer.
+    pub fn reset_cursor(&mut self) -> String {
+        self.cursor = "default";
+        self.push_cursor();
+        std::mem::take(&mut self.pending)
+    }
+
+    /// The pointer shape for the cell at `x`, `y`: a hand over things that
+    /// can be clicked, "copy" over code blocks, and a resize arrow on the
+    /// contents border.
+    fn cursor_shape(&self, x: u16, y: u16) -> &'static str {
+        if self.resizing || self.on_toc_border(x, y) {
+            return "ew-resize";
+        }
+        if self.press.is_some() || self.mode != Mode::Normal {
+            return "default";
+        }
+        if self.hits.iter().any(|h| h.y == y && (h.x0..h.x1).contains(&x)) {
+            return "pointer";
+        }
+        let g = self.geometry();
+        let in_text = y < g.rows && (g.content_x..g.content_x + g.content_w).contains(&x);
+        // `pos_at` clamps to the last line; rows past the end aren't in a block.
+        if in_text && self.scroll + (y as usize) < self.layout.lines.len() {
+            let line = self.pos_at(x, y).line;
+            if self.layout.code_blocks.iter().any(|b| (b.start..b.end).contains(&line)) {
+                return "copy";
+            }
+        }
+        "default"
+    }
+
+    fn on_toc_border(&self, x: u16, y: u16) -> bool {
+        let g = self.geometry();
+        g.toc_w > 0 && x == g.toc_w && y < g.rows
+    }
+
+    fn save_state(&self) {
+        if self.opts.persist {
+            state::save(State { toc: self.opts.toc, toc_width: self.opts.toc_width });
+        }
+    }
+
+    pub fn toc_scroll_by(&mut self, delta: isize) {
+        let rows = (self.geometry().rows as usize).saturating_sub(2);
+        let max = self.layout.headings.len().saturating_sub(rows);
+        self.toc_scroll = self.toc_scroll.saturating_add_signed(delta).min(max);
+        self.toc_followed = Some(self.current_heading());
+    }
+
+    fn mouse_action(&mut self, m: MouseEvent) -> bool {
         let hit = self.hits.iter().find(|h| h.y == m.row && (h.x0..h.x1).contains(&m.column)).copied();
+        let over_toc = m.column <= self.geometry().toc_w && self.geometry().toc_w > 0;
         match m.kind {
             MouseEventKind::Moved => {
                 let hover = match hit {
@@ -674,6 +772,8 @@ impl App {
                 self.hover = hover;
                 return changed;
             }
+            MouseEventKind::ScrollDown if over_toc => self.toc_scroll_by(3),
+            MouseEventKind::ScrollUp if over_toc => self.toc_scroll_by(-3),
             MouseEventKind::ScrollDown => {
                 self.hover = None;
                 self.scroll_by(3);
@@ -689,9 +789,26 @@ impl App {
                     self.mode = Mode::Normal;
                     return true;
                 }
+                if self.on_toc_border(m.column, m.row) {
+                    self.resizing = true;
+                    return true;
+                }
                 let g = self.geometry();
                 let in_content = m.column + 1 >= g.content_x && m.row < g.rows;
                 self.press = Some(Press { x: m.column, y: m.row, pos: self.pos_at(m.column, m.row), in_content });
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.resizing => {
+                let max = self.size.0.saturating_sub(MIN_TEXT).max(MIN_TOC);
+                let width = m.column.clamp(MIN_TOC, max);
+                if self.opts.toc_width == Some(width) {
+                    return false;
+                }
+                self.opts.toc_width = Some(width);
+                self.relayout();
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.resizing => {
+                self.resizing = false;
+                self.save_state();
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 let Some(press) = self.press.filter(|p| p.in_content) else { return false };
@@ -803,7 +920,11 @@ fn collect_anchors(blocks: &[Block], images: &[ImageRef], out: &mut HashMap<Stri
 impl App {
     fn pos_at(&self, column: u16, row: u16) -> Pos {
         let g = self.geometry();
-        let line = (self.scroll + row as usize).min(self.layout.lines.len().saturating_sub(1));
+        let mut line = (self.scroll + row as usize).min(self.layout.lines.len().saturating_sub(1));
+        // Rows under a scaled heading belong to its first row.
+        if let Some(Kind::HeadingCont { top }) = self.layout.lines.get(line).map(|l| l.kind) {
+            line = top;
+        }
         Pos { line, col: column.saturating_sub(g.content_x) as usize }
     }
 
@@ -860,28 +981,18 @@ impl App {
         for li in a.line..=b.line.min(self.layout.lines.len().saturating_sub(1)) {
             let line = &self.layout.lines[li];
             let Some((from, to)) = sel.cols(li) else { continue };
-            let text = match line.kind {
-                Kind::HeadingCont { .. } => continue,
-                // Scaled headings don't map columns 1:1; take them whole.
-                Kind::Heading { prefix, .. } => line.segs[prefix..].iter().map(|s| s.text.as_str()).collect(),
-                Kind::Text => {
-                    let mut text = String::new();
-                    let mut col = 0;
-                    for seg in &line.segs {
-                        if let Some(cell) = seg.image {
-                            col += cell.cols as usize;
-                            continue;
-                        }
-                        for ch in seg.text.chars() {
-                            if !seg.decor && col >= from && col < to {
-                                text.push(if ch == '\u{a0}' { ' ' } else { ch });
-                            }
-                            col += ch.width().unwrap_or(0);
-                        }
-                    }
-                    text
+            if matches!(line.kind, Kind::HeadingCont { .. }) {
+                continue;
+            }
+            let mut text = String::new();
+            for (si, off, col, w) in line.char_cols() {
+                let seg = &line.segs[si];
+                if seg.image.is_some() || seg.decor || !overlaps(col, w, from, to) {
+                    continue;
                 }
-            };
+                let ch = seg.text[off..].chars().next().unwrap_or(' ');
+                text.push(if ch == '\u{a0}' { ' ' } else { ch });
+            }
             out.push(text.trim_end().to_string());
         }
         out.join("\n")
@@ -898,14 +1009,10 @@ impl App {
         let mut end: Option<(usize, bool)> = None;
         for li in a.line..=b.line.min(self.layout.lines.len().saturating_sub(1)) {
             let line = &self.layout.lines[li];
-            let Some((mut from, mut to)) = sel.cols(li) else { continue };
-            if matches!(line.kind, Kind::Heading { .. }) {
-                // Scaled headings don't map columns 1:1; take them whole.
-                (from, to) = (0, usize::MAX);
-            }
+            let Some((from, to)) = sel.cols(li) else { continue };
             let cells = src_cells(line);
             for (i, &(col, w, s, e)) in cells.iter().enumerate() {
-                if col < to && col + w.max(1) > from {
+                if overlaps(col, w, from, to) {
                     start.get_or_insert((s, i == 0));
                     end = Some((e, i + 1 == cells.len()));
                 }
@@ -983,24 +1090,22 @@ impl App {
 /// that has a source position.
 fn src_cells(line: &layout::Line) -> Vec<(usize, usize, usize, usize)> {
     let mut cells = Vec::new();
-    let mut col = 0;
-    for seg in &line.segs {
-        let w = seg.width();
-        match (seg.src, seg.image) {
-            (Some(s), Some(_)) => cells.push((col, w, s.char_start(0), s.char_end(0, 0, 0))),
-            (Some(s), None) => {
-                let mut c = col;
-                for (off, ch) in seg.text.char_indices() {
-                    let cw = ch.width().unwrap_or(0);
-                    cells.push((c, cw, s.char_start(off), s.char_end(off, ch.len_utf8(), seg.text.len())));
-                    c += cw;
-                }
-            }
-            (None, _) => {}
+    for (si, off, col, w) in line.char_cols() {
+        let seg = &line.segs[si];
+        let Some(s) = seg.src else { continue };
+        if seg.image.is_some() {
+            cells.push((col, w, s.char_start(0), s.char_end(0, 0, 0)));
+        } else {
+            let len = seg.text[off..].chars().next().map_or(0, char::len_utf8);
+            cells.push((col, w, s.char_start(off), s.char_end(off, len, seg.text.len())));
         }
-        col += w;
     }
     cells
+}
+
+/// True when a cell at `col` (`w` wide) is inside columns `from..to`.
+fn overlaps(col: usize, w: usize, from: usize, to: usize) -> bool {
+    col < to && col + w.max(1) > from
 }
 
 /// Moves `off` back to the start of its source line if only block markup
@@ -1044,7 +1149,7 @@ mod tests {
         let caps =
             Caps { graphics: false, text_sizing: false, cell: (10, 20), bg: None, tmux: false, clipboard: false };
         let source = Source { path: None, name: "t.md".into(), text: md.into(), mtime: None };
-        let opts = Options { toc: false, max_width: Some(60) };
+        let opts = Options { toc: false, max_width: Some(60), toc_width: None, persist: false };
         App::new(caps, Theme::new(true, None), Images::new(false, false), source, opts)
     }
 
@@ -1085,6 +1190,60 @@ mod tests {
 
         let table = "| A | B |\n|---|---|\n| 1 | 2 |\n";
         assert_eq!(copy_between(table, "A", "2"), table.trim_end());
+    }
+
+    #[test]
+    fn copies_parts_of_scaled_headings() {
+        let mut app = app("# Hello World\n\n## Second heading\n");
+        app.caps.text_sizing = true;
+        app.relayout();
+        assert!(matches!(app.layout.lines[0].kind, Kind::Heading { .. }));
+        // H1 characters are two cells wide: "World" is at columns 12..22.
+        let sel = Selection { anchor: Pos { line: 0, col: 12 }, cur: Pos { line: 0, col: 21 } };
+        assert_eq!(app.selected_source(&sel).unwrap(), "World");
+        assert_eq!(app.selected_text(&sel), "World");
+        let sel = Selection { anchor: Pos { line: 0, col: 0 }, cur: Pos { line: 0, col: 3 } };
+        assert_eq!(app.selected_source(&sel).unwrap(), "# He");
+
+        // H2 is drawn in chunks of four characters, selected as a whole.
+        let h2 = app.layout.lines.iter().position(|l| l.plain().starts_with("Second")).unwrap();
+        let sel = Selection { anchor: Pos { line: h2, col: 0 }, cur: Pos { line: h2, col: 1 } };
+        assert_eq!(app.selected_source(&sel).unwrap(), "## Seco");
+    }
+
+    #[test]
+    fn mouse_shapes_resizes_and_scrolls_contents() {
+        let mut md = String::from("[link](https://x.y)\n\n```sh\necho hi\n```\n\n");
+        for i in 0..60 {
+            md.push_str(&format!("## Section {i}\n\ntext\n\n"));
+        }
+        let mut app = app(&md);
+        app.opts.toc = true;
+        app.size = (120, 40);
+        app.relayout();
+        app.draw(&mut Vec::new()).unwrap();
+        let ev = |app: &mut App, kind, column, row| {
+            app.handle(Event::Mouse(MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }));
+            std::mem::take(&mut app.pending)
+        };
+        let g = app.geometry();
+        let link = app.hits.iter().find(|h| matches!(h.target, HitTarget::Link(_))).copied().unwrap();
+        assert!(ev(&mut app, MouseEventKind::Moved, link.x0, link.y).contains("\x1b]22;pointer"));
+        let code = find(&app, "echo", 0);
+        let x = g.content_x + code.col as u16;
+        assert!(ev(&mut app, MouseEventKind::Moved, x, code.line as u16).contains("]22;copy"));
+        assert!(ev(&mut app, MouseEventKind::Moved, g.toc_w, 5).contains("]22;ew-resize"));
+
+        // Drag the border to resize the contents.
+        ev(&mut app, MouseEventKind::Down(MouseButton::Left), g.toc_w, 5);
+        ev(&mut app, MouseEventKind::Drag(MouseButton::Left), 30, 5);
+        ev(&mut app, MouseEventKind::Up(MouseButton::Left), 30, 5);
+        assert_eq!((app.opts.toc_width, app.geometry().toc_w), (Some(30), 30));
+
+        // Scrolling over the contents scrolls only the contents, and sticks.
+        ev(&mut app, MouseEventKind::ScrollDown, 3, 10);
+        app.draw(&mut Vec::new()).unwrap();
+        assert_eq!((app.scroll, app.toc_scroll), (0, 3));
     }
 
     #[test]

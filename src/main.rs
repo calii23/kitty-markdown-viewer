@@ -10,6 +10,7 @@ mod layout;
 mod links;
 mod probe;
 mod render;
+mod state;
 mod style;
 mod theme;
 
@@ -43,7 +44,8 @@ struct Args {
     /// Markdown file to show. Reads standard input when omitted or `-`.
     file: Option<PathBuf>,
 
-    /// Start with the table of contents hidden (toggle with `t`).
+    /// Start with the table of contents hidden (toggle with `t`; the last
+    /// state is remembered otherwise).
     #[arg(long)]
     no_toc: bool,
 
@@ -140,7 +142,13 @@ fn run(source: Source, args: &Args) -> Result<()> {
     };
     let theme = Theme::new(dark, caps.bg);
     let images = Images::new(caps.graphics, caps.tmux);
-    let opts = Options { toc: !args.no_toc, max_width: args.width.map(|w| w.max(20)) };
+    let saved = state::load();
+    let opts = Options {
+        toc: saved.toc && !args.no_toc,
+        max_width: args.width.map(|w| w.max(20)),
+        toc_width: saved.toc_width,
+        persist: true,
+    };
     let mut app = App::new(caps, theme, images, source, opts);
 
     let mut out = std::io::stdout();
@@ -172,7 +180,7 @@ fn run(source: Source, args: &Args) -> Result<()> {
             dirty |= app.expire_message();
         }
     }
-    let mut cleanup = String::new();
+    let mut cleanup = app.reset_cursor();
     app.images.cleanup(&mut cleanup);
     out.write_all(cleanup.as_bytes())?;
     out.flush()?;

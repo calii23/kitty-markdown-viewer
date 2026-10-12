@@ -32,6 +32,8 @@ const HELP: &[(&str, &str)] = &[
     ("click code", "copy the code block"),
     ("click tab", "convert JSON / YAML / TOML"),
     ("drag", "select and copy as Markdown"),
+    ("drag │", "resize the table of contents"),
+    ("wheel on toc", "scroll the table of contents"),
     ("Backspace h", "go back"),
     ("/ n N", "search, next / previous match"),
     ("t", "toggle table of contents"),
@@ -59,13 +61,19 @@ impl App {
 
         let current = self.current_heading();
         let toc_rows = (g.rows as usize).saturating_sub(2);
-        if let Some(c) = current {
-            if c < self.toc_scroll {
-                self.toc_scroll = c;
-            } else if c >= self.toc_scroll + toc_rows {
-                self.toc_scroll = c + 1 - toc_rows;
+        // Follow the reading position, unless the contents were scrolled by
+        // hand and the position is still in the same section.
+        if self.toc_followed != Some(current) {
+            self.toc_followed = Some(current);
+            if let Some(c) = current {
+                if c < self.toc_scroll {
+                    self.toc_scroll = c;
+                } else if c >= self.toc_scroll + toc_rows {
+                    self.toc_scroll = c + 1 - toc_rows;
+                }
             }
         }
+        self.toc_scroll = self.toc_scroll.min(self.layout.headings.len().saturating_sub(toc_rows));
 
         for y in 0..g.rows {
             if g.toc_w > 0 {
@@ -85,8 +93,22 @@ impl App {
                     self.draw_segs(&mut buf, &mut pre, usize::MAX, &segs[..prefix], y, g.content_x);
                     let text: String = segs[prefix..].iter().map(|s| s.text.as_str()).collect();
                     let style = segs.get(prefix).map(|s| s.style).unwrap_or_default();
-                    style.write_sgr(&mut buf);
-                    scale.render(&text, &mut buf);
+                    let selected = self.selection.and_then(|s| s.cols(li));
+                    let mut col: usize = segs[..prefix].iter().map(Seg::width).sum();
+                    let mut at = 0;
+                    let mut last = None;
+                    // Unit by unit, so the selection can be highlighted.
+                    for (bytes, w) in scale.units(&text) {
+                        let on = selected.is_some_and(|(s, e)| col < e && col + w.max(1) > s);
+                        let st = if on { Style { bg: Some(self.theme.select_bg), ..style } } else { style };
+                        if last != Some(st) {
+                            st.write_sgr(&mut buf);
+                            last = Some(st);
+                        }
+                        scale.render(&text[at..at + bytes], &mut buf);
+                        at += bytes;
+                        col += w;
+                    }
                     buf.push_str("\x1b[0m");
                 }
                 // A scaled heading that doesn't fit entirely is drawn at normal size.

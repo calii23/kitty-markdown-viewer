@@ -139,6 +139,18 @@ impl Scale {
         out
     }
 
+    /// The pieces `text` is drawn in, as `(bytes, terminal cells)`: single
+    /// characters at whole scales, packed chunks at fractional ones. Each
+    /// piece can be drawn on its own with `render`, e.g. to style it.
+    pub fn units(&self, text: &str) -> Vec<(usize, usize)> {
+        let s = self.s as usize;
+        if self.fractional() {
+            self.chunks(text).into_iter().map(|(c, w)| (c.len(), w * s)).collect()
+        } else {
+            text.chars().map(|c| (c.len_utf8(), c.width().unwrap_or(0) * s)).collect()
+        }
+    }
+
     /// Width in terminal cells that `text` occupies at this scale.
     pub fn width(&self, text: &str) -> usize {
         self.chunks(text).iter().map(|(_, w)| w).sum::<usize>() * self.s as usize
@@ -175,6 +187,7 @@ mod tests {
     fn full_scale_width() {
         let s = Scale { s: 2, n: 0, d: 0 };
         assert_eq!(s.width("Hello"), 10);
+        assert_eq!(s.units("Hé"), [(1, 2), (2, 2)]);
     }
 
     #[test]

@@ -65,12 +65,14 @@ rendered page than a terminal dump. It's a single Rust binary that starts in abo
 ### Navigation and links
 
 - **Table of contents** sidebar that highlights the section you're reading. Click an entry to
-  jump to it, or press `t` to hide it and let the text use the full width.
+  jump to it, scroll it on its own, drag its border to resize it, or press `t` to hide it and let
+  the text use the full width. Whether it's shown and how wide it is are remembered for next time.
 - **Links that do something.** `#anchors` jump to the heading, links to other Markdown files
   open in the viewer (with back navigation), and URLs and other files open with `open` on macOS
   or `xdg-open` on Linux.
 - **Hover a link** to see where it goes. Links to local files or headings that don't exist are
-  drawn in red, so broken links stand out.
+  drawn in red, so broken links stand out. The mouse pointer changes shape too: a hand over
+  links, a copy cursor over code blocks, and a resize arrow on the contents border.
 - **Search** with `/`, step through matches with `n` / `N`.
 - **Live reload:** keep the viewer open while you edit, and it refreshes when the file changes.
 
@@ -156,6 +158,8 @@ cat notes.md | mdv        # read from standard input
 | `--probe` | Print the terminal capabilities `mdv` detected and exit |
 
 Set `MDV_OPENER` to choose what opens external links, for example `MDV_OPENER="open -a Firefox"`.
+The contents sidebar's visibility and width are kept in `~/.local/state/mdv/state.toml` (or under
+`$XDG_STATE_HOME`), shared by all files.
 
 ### Keys
 
@@ -171,7 +175,7 @@ Set `MDV_OPENER` to choose what opens external links, for example `MDV_OPENER="o
 | `Enter` | Follow the focused link |
 | `Backspace` / `h` | Go back |
 | `/` `n` `N` | Search, next / previous match |
-| `t` | Toggle the table of contents |
+| `t` | Toggle the table of contents (remembered) |
 | `r` | Reload |
 | `Esc` | Clear the selection, link focus or search |
 | `?` | Show all keys |
@@ -181,10 +185,11 @@ Set `MDV_OPENER` to choose what opens external links, for example `MDV_OPENER="o
 
 | Action | Does |
 |---|---|
-| Scroll wheel | Scroll |
+| Scroll wheel | Scroll (over the contents: scroll the contents) |
 | Click a link | Follow it |
 | Hover a link | Show its target |
 | Click a contents entry | Jump to that section |
+| Drag the contents border | Resize the contents |
 | Click a code block or diagram | Copy its source |
 | Click a JSON / YAML / TOML tab | Show the block in that format |
 | Drag | Select, and copy the Markdown source on release |
