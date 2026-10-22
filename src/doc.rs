@@ -128,9 +128,18 @@ pub struct ImageRef {
     pub self_link: Option<usize>,
     /// Diagram source for images rendered from Mermaid code blocks.
     pub mermaid: Option<String>,
+    /// Formula for images rendered from LaTeX math.
+    pub math: Option<MathRef>,
     /// Size from HTML `width`/`height` attributes.
     pub width: Option<Length>,
     pub height: Option<Length>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MathRef {
+    pub tex: String,
+    /// `$$…$$` display math, as opposed to inline `$…$`.
+    pub display: bool,
 }
 
 /// An HTML size: CSS pixels or a percentage of the available width.
@@ -176,6 +185,11 @@ pub enum Block {
         id: usize,
         /// JSON/YAML/TOML blocks that parse, with their conversions.
         variants: Option<Variants>,
+    },
+    /// Display math (`$$…$$`) standing on its own, rendered as the image `img`.
+    Math {
+        img: usize,
+        src: Option<Src>,
     },
     /// A Mermaid code block, rendered as the image `img`.
     Mermaid {
@@ -324,7 +338,7 @@ impl<'a> P<'a> {
                 Event::Start(Tag::Paragraph) => {
                     flush(&mut loose, &mut out);
                     let inl = self.inlines(&|t| matches!(t, TagEnd::Paragraph));
-                    out.push(Block::Paragraph(inl));
+                    self.split_display_math(inl, &mut out);
                 }
                 Event::Start(Tag::Heading { level, id, .. }) => {
                     flush(&mut loose, &mut out);
@@ -548,25 +562,8 @@ impl<'a> P<'a> {
                 let src = self.text_src(&t);
                 self.push_text(&t, style, out, Some(src));
             }
-            Event::InlineMath(t) => {
-                let style = InlineStyle { math: true, ..self.style() };
-                let src = self.text_src(&t);
-                self.push_text(&t, style, out, Some(src));
-            }
-            Event::DisplayMath(t) => {
-                if !out.is_empty() {
-                    out.push(Inline::Break);
-                }
-                let style = InlineStyle { math: true, ..self.style() };
-                let src = self.text_src(&t).inexact();
-                for (i, line) in t.trim().lines().enumerate() {
-                    if i > 0 {
-                        out.push(Inline::Break);
-                    }
-                    self.push_text(&format!("  {line}"), style, out, Some(src));
-                }
-                out.push(Inline::Break);
-            }
+            Event::InlineMath(t) => self.push_math(&t, false, out),
+            Event::DisplayMath(t) => self.push_math(&t, true, out),
             Event::Html(h) | Event::InlineHtml(h) => {
                 let outer = self.html_src;
                 self.html_src = outer.or(Some(Src::span(self.range.start, self.range.end)));
@@ -654,9 +651,53 @@ impl<'a> P<'a> {
 
     fn push_image(&mut self, url: String, alt: String, out: &mut Vec<Inline>, src: Option<Src>) {
         let self_link = Some(self.add_link(url.clone()));
-        self.doc.images.push(ImageRef { url, alt, self_link, mermaid: None, width: None, height: None });
+        self.doc.images.push(ImageRef { url, alt, self_link, mermaid: None, math: None, width: None, height: None });
         let src = self.html_src.or(src);
         out.push(Inline::Image { idx: self.doc.images.len() - 1, link: self.links.last().copied(), src });
+    }
+
+    /// Adds a formula as an image. Its source span covers the delimiters,
+    /// so copying a selection keeps the `$`s.
+    fn push_math(&mut self, tex: &str, display: bool, out: &mut Vec<Inline>) {
+        let src = self.text_src(tex);
+        let src = Src { exact: false, ..Src::span(src.open.unwrap_or(src.start), src.close.unwrap_or(src.end)) };
+        let tex = tex.trim().to_string();
+        let mut hasher = DefaultHasher::new();
+        (&tex, display).hash(&mut hasher);
+        self.doc.images.push(ImageRef {
+            url: format!("math:{:016x}", hasher.finish()),
+            alt: tex.clone(),
+            self_link: None,
+            mermaid: None,
+            math: Some(MathRef { tex, display }),
+            width: None,
+            height: None,
+        });
+        out.push(Inline::Image { idx: self.doc.images.len() - 1, link: self.links.last().copied(), src: Some(src) });
+    }
+
+    /// Pushes a paragraph, moving display math out into blocks of its own.
+    fn split_display_math(&self, inl: Vec<Inline>, out: &mut Vec<Block>) {
+        let mut cur = Vec::new();
+        for i in inl {
+            match i {
+                Inline::Image { idx, src, link: None }
+                    if self.doc.images[idx].math.as_ref().is_some_and(|m| m.display) =>
+                {
+                    trim_breaks(&mut cur);
+                    if has_content(&cur) {
+                        out.push(Block::Paragraph(std::mem::take(&mut cur)));
+                    }
+                    cur.clear();
+                    out.push(Block::Math { img: idx, src });
+                }
+                i => cur.push(i),
+            }
+        }
+        trim_breaks(&mut cur);
+        if has_content(&cur) {
+            out.push(Block::Paragraph(cur));
+        }
     }
 
     fn mermaid(&mut self, source: String, src: CodeSrc) -> Block {
@@ -667,6 +708,7 @@ impl<'a> P<'a> {
             alt: "Mermaid diagram".into(),
             self_link: None,
             mermaid: Some(source.clone()),
+            math: None,
             width: None,
             height: None,
         });
@@ -823,12 +865,7 @@ impl<'a> P<'a> {
 
     fn html_paragraph(&mut self, html: &str, out: &mut Vec<Block>) {
         let inl = self.html_inlines(html);
-        let content = inl.iter().any(|i| match i {
-            Inline::Text { text, .. } => !text.trim().is_empty(),
-            Inline::Image { .. } => true,
-            Inline::Break => false,
-        });
-        if content {
+        if has_content(&inl) {
             out.push(Block::Paragraph(inl));
         }
     }
@@ -963,6 +1000,15 @@ impl<'a> P<'a> {
         *n += 1;
         slug
     }
+}
+
+/// True when inlines show anything: an image or non-blank text.
+fn has_content(inl: &[Inline]) -> bool {
+    inl.iter().any(|i| match i {
+        Inline::Text { text, .. } => !text.trim().is_empty(),
+        Inline::Image { .. } => true,
+        Inline::Break => false,
+    })
 }
 
 fn trim_breaks(inl: &mut Vec<Inline>) {
@@ -1453,6 +1499,24 @@ mod tests {
     #[test]
     fn decodes_entities() {
         assert_eq!(decode_entities("a &amp; b &lt;c&gt; &#65;&#x42; &bogus; & x"), "a & b <c> AB &bogus; & x");
+    }
+
+    #[test]
+    fn math_becomes_images() {
+        let src = "Inline $x^2$ here.\n\n$$\na + b\n$$\n\nText before\n$$c$$\nand after.\n";
+        let doc = parse(src);
+        let Block::Paragraph(inl) = &doc.blocks[0] else { panic!("{:?}", doc.blocks) };
+        let Inline::Image { idx, src: Some(s), .. } = inl[1] else { panic!("{inl:?}") };
+        assert_eq!(doc.images[idx].math, Some(MathRef { tex: "x^2".into(), display: false }));
+        assert_eq!(&src[s.start..s.end], "$x^2$");
+
+        // Display math is split out of its paragraph into a block.
+        let kinds: Vec<_> = doc.blocks.iter().map(std::mem::discriminant).collect();
+        let (para, math) = (std::mem::discriminant(&doc.blocks[0]), std::mem::discriminant(&doc.blocks[1]));
+        assert_eq!(kinds, [para, math, para, math, para]);
+        let Block::Math { img, .. } = doc.blocks[1] else { panic!() };
+        assert_eq!(doc.images[img].math, Some(MathRef { tex: "a + b".into(), display: true }));
+        assert_ne!(doc.images[idx].url, doc.images[img].url);
     }
 
     #[test]

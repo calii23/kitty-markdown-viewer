@@ -46,6 +46,10 @@ rendered page than a terminal dump. It's a single Rust binary that starts in abo
 - **Mermaid diagrams.** ` ```mermaid ` blocks are rendered to images in-process (no Node.js,
   no headless browser) and match your light or dark theme. A diagram that doesn't parse falls
   back to its source, with the error in the header.
+- **LaTeX math.** `$…$` and `$$…$$` formulas are typeset as images with
+  [RaTeX](https://github.com/erweixin/RaTeX), a pure-Rust port of KaTeX: fractions, sums,
+  matrices, `cases` and the rest of KaTeX's syntax, in your text color. Inline formulas sit in
+  the line (growing to a few rows when they're tall), display math is centered.
 - **Syntax highlighting** for [bat](https://github.com/sharkdp/bat)'s whole language set:
   JavaScript/TypeScript (JSX/TSX), Rust, Go, Python, Ruby, Java, Kotlin, C/C++, Objective-C,
   PHP, Perl, Lua, SQL, HTML, XML, CSS/SCSS/Sass, JSON, YAML, TOML, protobuf, Diff, Bash, Fish and
@@ -54,7 +58,7 @@ rendered page than a terminal dump. It's a single Rust binary that starts in abo
   same data in the other formats. The original is marked, and formats the data can't be expressed
   in are struck out (TOML has no `null`, for example).
 - **GitHub-flavored Markdown:** tables with alignment, task lists, strikethrough, footnotes,
-  alerts (`> [!NOTE]`, `[!TIP]`, `[!WARNING]`…), definition lists, math and front matter.
+  alerts (`> [!NOTE]`, `[!TIP]`, `[!WARNING]`…), definition lists and front matter.
 - **HTML as GitHub shows it.** The HTML that READMEs use for layout is rendered, not dropped:
   `align="center"` blocks (including `<div align="center">` around Markdown), `<h1>`–`<h6>`
   headings in the contents, `<table>` with images in its cells, lists, `<details>`, `<pre>`,
@@ -72,13 +76,13 @@ rendered page than a terminal dump. It's a single Rust binary that starts in abo
   or `xdg-open` on Linux.
 - **Hover a link** to see where it goes. Links to local files or headings that don't exist are
   drawn in red, so broken links stand out. The mouse pointer changes shape too: a hand over
-  links, a copy cursor over code blocks, and a resize arrow on the contents border.
+  links, a copy cursor over code blocks and formulas, and a resize arrow on the contents border.
 - **Search** with `/`, step through matches with `n` / `N`.
 - **Live reload:** keep the viewer open while you edit, and it refreshes when the file changes.
 
 ### Copying
 
-- **Click a code block** (or a diagram) to copy its source.
+- **Click a code block**, diagram or formula to copy its source (the LaTeX, for formulas).
 - **Drag to select**, like tmux copy mode. You get the *Markdown source* of the selection, markup
   included: select a bold word and get `**bold**`, select a list and get `- item` lines, select a
   table and get its pipes.
@@ -190,7 +194,7 @@ The contents sidebar's visibility and width are kept in `~/.local/state/mdv/stat
 | Hover a link | Show its target |
 | Click a contents entry | Jump to that section |
 | Drag the contents border | Resize the contents |
-| Click a code block or diagram | Copy its source |
+| Click a code block, diagram or formula | Copy its source |
 | Click a JSON / YAML / TOML tab | Show the block in that format |
 | Drag | Select, and copy the Markdown source on release |
 | Right-click | Go back |
@@ -229,7 +233,7 @@ covers several rows, and an image is a block of placeholder cells.
 | `layout.rs` | Wraps the document into terminal lines: lists, quotes, tables, code blocks, scaled headings and image cells |
 | `render.rs` | Draws each frame in one synchronized update, so full redraws don't flicker |
 | `kitty.rs` | Encodes graphics commands, Unicode image placeholders and OSC 66 sized text |
-| `images.rs` | Loads, decodes and rasterizes images and Mermaid diagrams on background threads |
+| `images.rs` | Loads, decodes and rasterizes images, Mermaid diagrams and LaTeX formulas on background threads |
 | `convert.rs` | Converts JSON, YAML and TOML between each other, keeping key order |
 | `app.rs` | State and input: scrolling, links, search, history, selection and copying |
 
@@ -267,6 +271,7 @@ Kitty Markdown Viewer builds on great work by others:
 [two-face](https://codeberg.org/CosmicHarper/two-face),
 [resvg](https://github.com/linebender/resvg),
 [mermaid-rs-renderer](https://github.com/1jehuang/mermaid-rs-renderer),
+[RaTeX](https://github.com/erweixin/RaTeX) with the [KaTeX](https://katex.org) fonts,
 [crossterm](https://github.com/crossterm-rs/crossterm) and the
 [Catppuccin](https://catppuccin.com) palette.
 

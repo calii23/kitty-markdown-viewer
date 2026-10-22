@@ -56,7 +56,7 @@ impl Images {
     /// Turns an image reference into a loader key: URLs stay as they are,
     /// paths become absolute.
     pub fn resolve(url: &str, base: &Path) -> String {
-        if ["http://", "https://", "data:", "mermaid:"].iter().any(|p| url.starts_with(p)) {
+        if ["http://", "https://", "data:", "mermaid:", "math:"].iter().any(|p| url.starts_with(p)) {
             return url.to_string();
         }
         let path = url.strip_prefix("file://").unwrap_or(url);
@@ -87,6 +87,21 @@ impl Images {
         let (key, source) = (key.to_string(), source.to_string());
         std::thread::spawn(move || {
             let result = render_mermaid(&source, dark, bg);
+            let _ = tx.send((key, result));
+        });
+    }
+
+    /// Renders a LaTeX formula in the background, stored under `key`. `em`
+    /// is the font size in pixels, `display` picks display (block) style.
+    pub fn request_math(&mut self, key: &str, tex: &str, display: bool, color: Rgb, em: f32) {
+        if !self.enabled || self.entries.contains_key(key) {
+            return;
+        }
+        self.entries.insert(key.to_string(), Entry::Loading);
+        let tx = self.tx.clone();
+        let (key, tex) = (key.to_string(), tex.to_string());
+        std::thread::spawn(move || {
+            let result = render_math(&tex, display, color, em);
             let _ = tx.send((key, result));
         });
     }
@@ -179,6 +194,34 @@ fn render_mermaid(source: &str, dark: bool, bg: Rgb) -> Result<Loaded, String> {
     encode(img.width(), img.height(), img)
 }
 
+/// LaTeX to PNG with RaTeX (KaTeX's layout rules and fonts), drawn at twice
+/// the size it's reported at so it stays crisp.
+fn render_math(tex: &str, display: bool, color: Rgb, em: f32) -> Result<Loaded, String> {
+    use ratex_layout::{LayoutOptions, layout, to_display_list, validate_layout};
+    use ratex_render::{RenderOptions, render_to_png};
+    use ratex_types::{color::Color, math_style::MathStyle};
+
+    let ast = ratex_parser::parser::parse(tex).map_err(|e| first_line(&e.to_string()))?;
+    let style = if display { MathStyle::Display } else { MathStyle::Text };
+    let fg = Color::rgb(color.0 as f32 / 255.0, color.1 as f32 / 255.0, color.2 as f32 / 255.0);
+    let lbox = layout(&ast, &LayoutOptions::default().with_style(style).with_color(fg));
+    validate_layout(&lbox).map_err(|e| first_line(&e))?;
+    let opts = RenderOptions {
+        font_size: em,
+        padding: em / 8.0,
+        background_color: Color { a: 0.0, ..Color::WHITE },
+        device_pixel_ratio: 2.0,
+        ..RenderOptions::default()
+    };
+    let png = render_to_png(&to_display_list(&lbox), &opts).map_err(|e| first_line(&e))?;
+    let img = image::load_from_memory(&png).map_err(|e| e.to_string())?;
+    encode(img.width().div_ceil(2), img.height().div_ceil(2), img)
+}
+
+fn first_line(s: &str) -> String {
+    s.lines().next().unwrap_or("invalid formula").to_string()
+}
+
 fn encode(width: u32, height: u32, img: DynamicImage) -> Result<Loaded, String> {
     let img = if img.width() > MAX_SIDE || img.height() > MAX_SIDE {
         img.resize(MAX_SIDE, MAX_SIDE, image::imageops::FilterType::Triangle)
@@ -253,6 +296,23 @@ mod tests {
         let img = render_mermaid("flowchart LR\n  A --> B --> C\n", true, Rgb(30, 30, 46)).unwrap();
         assert!(img.width > img.height, "LR flowchart should be wide: {}x{}", img.width, img.height);
         assert!(img.png.starts_with(b"\x89PNG"));
+    }
+
+    #[test]
+    fn renders_latex() {
+        let cases = [
+            r"P_i = W_p \cdot \left(1 - \frac{p_i - p_{min}}{2\,p_{min} - p_{min}}\right)",
+            "\\text{Status}_i =\n\\begin{cases}\n\\text{(blank)} & \\text{if } M = 0 \\\\\n1 & \\text{if } Y_i = M\n\\end{cases}",
+            r"\text{Rank}_i = 1 + \left|\{\, m \in B : S_m > S_i \,\}\right|",
+        ];
+        for tex in cases {
+            let img = render_math(tex, true, Rgb(205, 214, 244), 20.0).unwrap_or_else(|e| panic!("{tex}: {e}"));
+            assert!(img.width > img.height && img.height >= 20, "{tex}: {}x{}", img.width, img.height);
+            assert!(img.png.starts_with(b"\x89PNG"));
+        }
+        let inline = render_math("x^2", false, Rgb(0, 0, 0), 20.0).unwrap();
+        assert!(inline.height < 40, "{}", inline.height);
+        assert!(render_math(r"\frac{a", true, Rgb(0, 0, 0), 20.0).is_err());
     }
 
     #[test]

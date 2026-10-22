@@ -259,10 +259,15 @@ impl App {
         let base = source.base_dir();
         self.image_keys = self.doc.images.iter().map(|i| Images::resolve(&i.url, &base)).collect();
         let dark = self.theme.bg.luminance() < 0.5;
+        let em = self.caps.cell.1 as f32 * 0.8;
         for (img, key) in self.doc.images.iter().zip(&self.image_keys) {
             match &img.mermaid {
                 Some(source) => self.images.request_mermaid(key, source, dark, self.theme.bg),
-                None => self.images.request(key),
+                None => match &img.math {
+                    // Formulas are drawn at about the size of the text.
+                    Some(m) => self.images.request_math(key, &m.tex, m.display, self.theme.fg, em),
+                    None => self.images.request(key),
+                },
             }
         }
         let mut widest = 0;
@@ -730,8 +735,9 @@ impl App {
         let in_text = y < g.rows && (g.content_x..g.content_x + g.content_w).contains(&x);
         // `pos_at` clamps to the last line; rows past the end aren't in a block.
         if in_text && self.scroll + (y as usize) < self.layout.lines.len() {
-            let line = self.pos_at(x, y).line;
-            if self.layout.code_blocks.iter().any(|b| (b.start..b.end).contains(&line)) {
+            let pos = self.pos_at(x, y);
+            let in_block = self.layout.code_blocks.iter().any(|b| (b.start..b.end).contains(&pos.line));
+            if in_block || self.inline_math_at(pos).is_some() {
                 return "copy";
             }
         }
@@ -928,6 +934,16 @@ impl App {
         Pos { line, col: column.saturating_sub(g.content_x) as usize }
     }
 
+    /// The inline formula drawn at `pos`: its TeX, column and width.
+    fn inline_math_at(&self, pos: Pos) -> Option<(String, usize, usize)> {
+        let line = self.layout.lines.get(pos.line)?;
+        line.char_cols().into_iter().find_map(|(si, _, col, w)| {
+            let cell = line.segs[si].image?;
+            let math = self.doc.images[cell.img].math.as_ref()?;
+            (col..col + w).contains(&pos.col).then(|| (math.tex.clone(), col, w))
+        })
+    }
+
     /// A press and release without dragging: follow a link, jump via the
     /// contents, or copy the code block under the pointer.
     fn click(&mut self, press: Press) {
@@ -956,6 +972,15 @@ impl App {
                 });
             }
             None if press.in_content => {
+                if let Some((tex, col, w)) = self.inline_math_at(press.pos) {
+                    let line = press.pos.line;
+                    self.selection = Some(Selection {
+                        anchor: Pos { line, col },
+                        cur: Pos { line, col: col + w.saturating_sub(1) },
+                    });
+                    self.copy(&tex, "formula");
+                    return;
+                }
                 let line = press.pos.line;
                 let Some(block) = self.layout.code_blocks.iter().find(|b| (b.start..b.end).contains(&line)).cloned()
                 else {
@@ -967,7 +992,8 @@ impl App {
                     cur: Pos { line: block.end - 1, col: usize::MAX - 1 },
                 });
                 let n = block.text.lines().count();
-                self.copy(&block.text, &format!("code block ({n} line{})", if n == 1 { "" } else { "s" }));
+                let lines = if n > 1 { format!(" ({n} lines)") } else { String::new() };
+                self.copy(&block.text, &format!("{}{lines}", block.kind));
             }
             None => {}
         }
@@ -1187,6 +1213,7 @@ mod tests {
         assert_eq!(copy_between("- one\n- two\n\nAfter.\n", "one", "two"), "- one\n- two");
         assert_eq!(copy_between("> quoted *words*\n", "quoted", "words"), "> quoted *words*");
         assert_eq!(copy_between("## Title\n\ntext\n", "Title", "Title"), "## Title");
+        assert_eq!(copy_between("So $E = mc^2$ holds.\n", "So", "holds."), "So $E = mc^2$ holds.");
 
         let table = "| A | B |\n|---|---|\n| 1 | 2 |\n";
         assert_eq!(copy_between(table, "A", "2"), table.trim_end());

@@ -136,12 +136,15 @@ pub struct HeadingEntry {
     pub line: usize,
 }
 
-/// Lines `start..end` hold a code block whose source is `text`.
+/// Lines `start..end` hold a code block (or diagram, or formula) whose
+/// source is `text`; clicking it copies that.
 #[derive(Clone, Debug)]
 pub struct CodeSpan {
     pub start: usize,
     pub end: usize,
     pub text: String,
+    /// What was copied, for the status message ("code block", "formula").
+    pub kind: &'static str,
 }
 
 /// A clickable format tab in a data code block's header.
@@ -262,7 +265,12 @@ impl Builder<'_> {
                         Seg { src: span, ..Seg::decor("mermaid · click to copy source", Style::fg(t.dim).italic()) };
                     self.push(rest, vec![caption]);
                     let text = source.trim_end().to_string();
-                    self.out.code_blocks.push(CodeSpan { start, end: self.out.lines.len(), text });
+                    self.out.code_blocks.push(CodeSpan {
+                        start,
+                        end: self.out.lines.len(),
+                        text,
+                        kind: "diagram source",
+                    });
                 }
                 // Not rendered (yet): show the source, with the error if it failed.
                 None => {
@@ -273,6 +281,7 @@ impl Builder<'_> {
                     self.code("mermaid", source, &label, Some(src), None, first, rest, width);
                 }
             },
+            Block::Math { img, src } => self.display_math(*img, *src, first, rest, width),
             Block::FrontMatter(text, src) => {
                 self.code("yaml", text, "front matter", Some(src), None, first, rest, width)
             }
@@ -355,6 +364,36 @@ impl Builder<'_> {
                 *prefix += 1;
             }
         }
+    }
+
+    /// A `$$…$$` formula: the rendered image centered, or its source until
+    /// it's rendered (or when it can't be). Clicking it copies the source.
+    fn display_math(&mut self, img: usize, src: Option<Src>, first: &[Seg], rest: &[Seg], width: usize) {
+        let t = self.env.theme;
+        let tex = self.doc.images[img].alt.clone();
+        let start = self.out.lines.len();
+        match (self.image_cell(img, width), (self.env.image_error)(img)) {
+            (Some(cell), _) => {
+                self.flow(vec![Piece::Image(cell, None, src)], first, rest, width);
+                self.center(start, first.len(), rest.len(), width);
+            }
+            (None, Some(e)) => {
+                self.code("latex", &tex, &format!("latex · ✖ {e}"), None, None, first, rest, width);
+                self.out.code_blocks.pop();
+            }
+            (None, None) => {
+                let style = Style::fg(t.math).italic();
+                let mut segs = Vec::new();
+                for (i, line) in tex.lines().enumerate() {
+                    if i > 0 {
+                        segs.push(Seg::new("\n", style));
+                    }
+                    segs.push(Seg { src: src.map(Src::inexact), ..Seg::new(format!("  {line}"), style) });
+                }
+                self.flow(vec![Piece::Segs(segs)], first, rest, width);
+            }
+        }
+        self.out.code_blocks.push(CodeSpan { start, end: self.out.lines.len(), text: tex, kind: "formula" });
     }
 
     fn heading(&mut self, level: u8, inlines: &[Inline], anchor: &str, first: &[Seg], rest: &[Seg], width: usize) {
@@ -551,7 +590,12 @@ impl Builder<'_> {
             }
         }
         self.push(rest, with_src(pad(Vec::new()), src.and_then(|c| at(c.block.1))));
-        self.out.code_blocks.push(CodeSpan { start, end: self.out.lines.len(), text: code.to_string() });
+        self.out.code_blocks.push(CodeSpan {
+            start,
+            end: self.out.lines.len(),
+            text: code.to_string(),
+            kind: "code block",
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -666,7 +710,7 @@ impl Builder<'_> {
         for piece in self.pieces(inl, style, width, true) {
             match piece {
                 Piece::Segs(segs) if segs.is_empty() => {}
-                Piece::Segs(segs) => lines.extend(wrap(&segs, width)),
+                Piece::Segs(segs) => lines.extend(wrap(&segs, width).into_iter().flat_map(tall_rows)),
                 Piece::Image(cell, link, src) => lines.extend((0..cell.rows).map(|row| {
                     vec![Seg { link, src, image: Some(ImageCell { row, ..cell }), ..Seg::new("", Style::default()) }]
                 })),
@@ -692,13 +736,21 @@ impl Builder<'_> {
                     let src = *src;
                     let cell = if images { self.image_cell(*idx, width) } else { None };
                     let link = link.or(self.doc.images[*idx].self_link);
+                    let inline_math = self.doc.images[*idx].math.as_ref().is_some_and(|m| !m.display);
                     match cell {
-                        Some(cell) if cell.rows == 1 => {
+                        // Taller inline formulas are spread over lines by `tall_rows`.
+                        Some(cell) if cell.rows == 1 || inline_math => {
                             cur.push(Seg { image: Some(cell), link, src, ..Seg::new("", base) })
                         }
                         Some(cell) => {
                             out.push(Piece::Segs(std::mem::take(&mut cur)));
                             out.push(Piece::Image(cell, link, src));
+                        }
+                        // Formulas that aren't drawn show their source.
+                        None if self.doc.images[*idx].math.is_some() => {
+                            let tex = &self.doc.images[*idx].alt;
+                            let st = Style { fg: Some(t.math), italic: true, ..base };
+                            cur.push(Seg { link, src: src.map(Src::inexact), ..Seg::new(tex.replace('\n', " "), st) });
                         }
                         None => {
                             let alt = &self.doc.images[*idx].alt;
@@ -778,13 +830,23 @@ impl Builder<'_> {
         let max = MAX_PLACEHOLDER_CELLS as f64;
         let avail = (avail as f64).min(max);
         let (w, h) = self.sized(idx, w as f64, h as f64, avail * cw);
+        let max_rows = (self.env.max_image_rows.max(4) as f64).min(max);
+        // Formulas keep their natural size, rounded up to whole cells (the
+        // terminal fits them inside); inline ones grow to three rows at most.
+        if let Some(math) = &self.doc.images[idx].math {
+            let limit = if math.display { max_rows } else { 3.0 };
+            let scale = (avail * cw / w).min(limit * ch / h).min(1.0);
+            let (w, h) = (w * scale, h * scale);
+            let rows = (h / ch - 0.2).ceil().clamp(1.0, limit);
+            let cols = (w / cw).ceil().clamp(1.0, avail);
+            return Some(ImageCell { img: idx, cols: cols as u16, rows: rows as u16, row: 0 });
+        }
         let cols_for_rows = |rows: f64| (rows * ch * w / h / cw).round().clamp(1.0, avail);
         let (cols, rows) = if h <= ch * 1.5 {
             (cols_for_rows(1.0), 1.0)
         } else {
             let cols = (w / cw).ceil().clamp(1.0, avail);
             let rows = (cols * cw * h / w / ch).round().max(2.0);
-            let max_rows = (self.env.max_image_rows.max(4) as f64).min(max);
             if rows > max_rows { (cols_for_rows(max_rows), max_rows) } else { (cols, rows) }
         };
         Some(ImageCell { img: idx, cols: cols as u16, rows: rows as u16, row: 0 })
@@ -826,7 +888,13 @@ impl Builder<'_> {
                         continue;
                     }
                     for line in wrap(&segs, width) {
-                        self.push(if used_first { rest } else { first }, line);
+                        let rows = tall_rows(line);
+                        let n = rows.len();
+                        for (k, row) in rows.into_iter().enumerate() {
+                            // Rows above the text get the continuation prefix.
+                            let text_row = k + 1 == n;
+                            self.push(if used_first || !text_row { rest } else { first }, row);
+                        }
                         used_first = true;
                     }
                 }
@@ -844,6 +912,29 @@ impl Builder<'_> {
             self.push(first, Vec::new());
         }
     }
+}
+
+/// Spreads a line holding inline images taller than one row (formulas) over
+/// several lines: the images' upper rows above, at the same columns, and
+/// the text with the images' bottom rows on the last line.
+fn tall_rows(line: Vec<Seg>) -> Vec<Vec<Seg>> {
+    let tall = line.iter().filter_map(|s| s.image).map(|c| c.rows).max().unwrap_or(1);
+    if tall <= 1 {
+        return vec![line];
+    }
+    (0..tall)
+        .map(|r| {
+            line.iter()
+                .map(|s| match s.image {
+                    Some(cell) if r + cell.rows >= tall => {
+                        Seg { image: Some(ImageCell { row: r + cell.rows - tall, ..cell }), ..s.clone() }
+                    }
+                    _ if r + 1 == tall => s.clone(),
+                    _ => Seg::decor(" ".repeat(s.width()), Style::default()),
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// Appends bytes `off..off + text.len()` of `like`'s text, merging with the

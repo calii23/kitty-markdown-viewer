@@ -153,8 +153,21 @@ server:
 
     Indented code block without a language.
 
+## Math
+
+LaTeX formulas are typeset as images, inline like $\sqrt{a^2 + b^2}$ or
+$\sum_{k=1}^{n} k = \frac{n(n+1)}{2}$, and as display math. Click one to copy its source.
+
 $$
 \int_0^1 x^2 \, dx = \frac{1}{3}
+$$
+
+$$
+f(n) =
+\begin{cases}
+n / 2 & \text{if } n \text{ is even} \\
+3n + 1 & \text{if } n \text{ is odd}
+\end{cases}
 $$
 
 ## Diagrams
